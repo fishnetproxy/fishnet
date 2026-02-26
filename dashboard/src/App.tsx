@@ -15,6 +15,8 @@ const AlertsPage = lazy(() => import("@/pages/alerts/AlertsPage"));
 const SpendPage = lazy(() => import("@/pages/spend/SpendPage"));
 const OnchainPage = lazy(() => import("@/pages/onchain/OnchainPage"));
 const CredentialsPage = lazy(() => import("@/pages/credentials/CredentialsPage"));
+const ExchangeConfigPage = lazy(() => import("@/pages/exchange-config/ExchangeConfigPage"));
+const ZkProofsPage = lazy(() => import("@/pages/zk-proofs/ZkProofsPage"));
 const LoginPage = lazy(() => import("@/pages/login/LoginPage"));
 const LandingPage = lazy(() => import("@/pages/landing/LandingPage"));
 const DocsLayout = lazy(() => import("@/pages/docs/DocsLayout"));
@@ -184,6 +186,22 @@ export default function App() {
                 element={
                   <Suspense fallback={<PageLoader />}>
                     <CredentialsPage />
+                  </Suspense>
+                }
+              />
+              <Route
+                path={ROUTES.EXCHANGE_CONFIG}
+                element={
+                  <Suspense fallback={<PageLoader />}>
+                    <ExchangeConfigPage />
+                  </Suspense>
+                }
+              />
+              <Route
+                path={ROUTES.ZK_PROOFS}
+                element={
+                  <Suspense fallback={<PageLoader />}>
+                    <ZkProofsPage />
                   </Suspense>
                 }
               />

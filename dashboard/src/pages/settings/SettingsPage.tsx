@@ -2,6 +2,11 @@ import { useTheme } from "@/hooks/use-theme";
 import { Card } from "@/components/ui/Card";
 import { Toggle } from "@/components/ui/Toggle";
 import { AlertConfigPanel } from "@/pages/alerts/AlertConfigPanel";
+import { PasswordChangeCard } from "./PasswordChangeCard";
+import { VaultBackupRestoreCard } from "./VaultBackupRestoreCard";
+import { NetworkIsolationCard } from "./NetworkIsolationCard";
+import { SignerModeCard } from "./SignerModeCard";
+import { DangerZoneCard } from "./DangerZoneCard";
 
 export default function SettingsPage() {
   const { theme, toggle } = useTheme();
@@ -24,6 +29,14 @@ export default function SettingsPage() {
       </Card>
 
       <AlertConfigPanel />
+
+      <PasswordChangeCard />
+
+      <VaultBackupRestoreCard />
+
+      <NetworkIsolationCard />
+
+      <SignerModeCard />
 
       <Card title="Proxy Configuration">
         <div className="space-y-4">
@@ -54,6 +67,8 @@ export default function SettingsPage() {
           </div>
         </div>
       </Card>
+
+      <DangerZoneCard />
     </div>
   );
 }
