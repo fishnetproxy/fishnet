@@ -11,6 +11,7 @@ export const ROUTES = {
   DOCS_OPENCLAW: "/docs/openclaw",
   DOCS_POLICIES: "/docs/policies",
   DOCS_SECURITY: "/docs/security",
+  CREDENTIALS: "/credentials",
 } as const;
 
 export const POLLING_INTERVALS = {
