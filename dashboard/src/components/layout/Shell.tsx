@@ -1,7 +1,10 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { Outlet, useLocation } from "react-router-dom";
 import { Sidebar } from "./Sidebar";
 import { AlertsProvider, useAlertsContext } from "@/context/alerts-context";
+import { ToastProvider } from "@/context/toast-context";
+import { CommandPalette } from "@/components/CommandPalette";
+import { useMediaQuery } from "@/hooks/use-media-query";
 import { ROUTES } from "@/lib/constants";
 
 const routeTitles: Record<string, string> = {
@@ -23,16 +26,25 @@ const routeSubtitles: Record<string, string> = {
 export function Shell() {
   return (
     <AlertsProvider>
-      <ShellInner />
+      <ToastProvider>
+        <ShellInner />
+      </ToastProvider>
     </AlertsProvider>
   );
 }
 
 function ShellInner() {
+  const isMobile = useMediaQuery("(max-width: 768px)");
+
   const [collapsed, setCollapsed] = useState(() => {
     if (typeof window === "undefined") return false;
     return localStorage.getItem("sidebar-collapsed") === "true";
   });
+
+  // Auto-collapse on small viewports
+  useEffect(() => {
+    if (isMobile) setCollapsed(true);
+  }, [isMobile]);
 
   const location = useLocation();
   const title = routeTitles[location.pathname] ?? "Fishnet";
@@ -78,6 +90,9 @@ function ShellInner() {
           </div>
         </main>
       </div>
+
+      {/* Command palette (Cmd+K) */}
+      <CommandPalette />
     </div>
   );
 }

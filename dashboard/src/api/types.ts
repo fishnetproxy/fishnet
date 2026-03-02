@@ -203,6 +203,56 @@ export interface PermitsResponse {
   permits: Permit[];
 }
 
+// --- Credentials ---
+export interface Credential {
+  id: string;
+  service: string;
+  name: string;
+  created_at: string;
+  last_used_at: string | null;
+}
+
+export interface CredentialsResponse {
+  credentials: Credential[];
+}
+
+export interface CreateCredentialPayload {
+  service: string;
+  name: string;
+  api_key: string;
+}
+
+// --- Status ---
+export interface StatusResponse {
+  running: boolean;
+  uptime_seconds: number;
+  active_services: string[];
+  proxy_port: number;
+  dashboard_port: number;
+  version: string;
+}
+
+// --- Webhook ---
+export interface WebhookConfig {
+  url: string;
+  enabled: boolean;
+}
+
+export interface WebhookConfigResponse {
+  webhook: WebhookConfig | null;
+}
+
+export interface WebhookTestResponse {
+  success: boolean;
+  message: string;
+}
+
+// --- Policy Quick Config (wizard) ---
+export interface PolicyQuickConfigPayload {
+  daily_budget_usd: number;
+  rate_limit_rpm: number;
+}
+
 // --- Generic ---
 export interface ApiError {
   error: string;

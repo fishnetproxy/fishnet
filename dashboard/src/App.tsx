@@ -15,6 +15,12 @@ const AlertsPage = lazy(() => import("@/pages/alerts/AlertsPage"));
 const SpendPage = lazy(() => import("@/pages/spend/SpendPage"));
 const OnchainPage = lazy(() => import("@/pages/onchain/OnchainPage"));
 const LoginPage = lazy(() => import("@/pages/login/LoginPage"));
+const LandingPage = lazy(() => import("@/pages/landing/LandingPage"));
+const DocsLayout = lazy(() => import("@/pages/docs/DocsLayout"));
+const GettingStarted = lazy(() => import("@/pages/docs/GettingStarted"));
+const OpenClawGuide = lazy(() => import("@/pages/docs/OpenClawGuide"));
+const PolicyReference = lazy(() => import("@/pages/docs/PolicyReference"));
+const SecurityModel = lazy(() => import("@/pages/docs/SecurityModel"));
 
 function PageLoader() {
   return (
@@ -38,6 +44,23 @@ export default function App() {
       <ThemeContext value={themeValue}>
         <BrowserRouter>
           <Routes>
+            {/* Public: Landing page */}
+            <Route
+              path={ROUTES.WELCOME}
+              element={
+                <Suspense
+                  fallback={
+                    <div
+                      className="h-screen"
+                      style={{ background: "#08080A" }}
+                    />
+                  }
+                >
+                  <LandingPage />
+                </Suspense>
+              }
+            />
+
             {/* Public: Login page */}
             <Route
               path={ROUTES.LOGIN}
@@ -56,6 +79,64 @@ export default function App() {
                 </PublicRoute>
               }
             />
+
+            {/* Public: Docs site */}
+            <Route
+              path="/docs"
+              element={
+                <Suspense
+                  fallback={
+                    <div
+                      className="h-screen"
+                      style={{ background: "#0A0A0B" }}
+                    />
+                  }
+                >
+                  <DocsLayout />
+                </Suspense>
+              }
+            >
+              <Route
+                index
+                element={
+                  <Suspense fallback={<PageLoader />}>
+                    <GettingStarted />
+                  </Suspense>
+                }
+              />
+              <Route
+                path="getting-started"
+                element={
+                  <Suspense fallback={<PageLoader />}>
+                    <GettingStarted />
+                  </Suspense>
+                }
+              />
+              <Route
+                path="openclaw"
+                element={
+                  <Suspense fallback={<PageLoader />}>
+                    <OpenClawGuide />
+                  </Suspense>
+                }
+              />
+              <Route
+                path="policies"
+                element={
+                  <Suspense fallback={<PageLoader />}>
+                    <PolicyReference />
+                  </Suspense>
+                }
+              />
+              <Route
+                path="security"
+                element={
+                  <Suspense fallback={<PageLoader />}>
+                    <SecurityModel />
+                  </Suspense>
+                }
+              />
+            </Route>
 
             {/* Protected: Dashboard shell */}
             <Route
@@ -107,8 +188,11 @@ export default function App() {
               />
             </Route>
 
-            {/* Catch-all → login */}
-            <Route path="*" element={<Navigate to={ROUTES.LOGIN} replace />} />
+            {/* Catch-all → landing page */}
+            <Route
+              path="*"
+              element={<Navigate to={ROUTES.WELCOME} replace />}
+            />
           </Routes>
         </BrowserRouter>
       </ThemeContext>
