@@ -43,6 +43,10 @@ tiny-keccak.workspace = true
 rust-embed = { workspace = true, optional = true }
 mime_guess = { workspace = true, optional = true }
 
+[[bin]]
+name = "fishnet-sign"
+path = "src/bin/fishnet_sign.rs"
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
