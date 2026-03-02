@@ -18,6 +18,33 @@ contract MockTarget {
     }
 }
 
+contract ReentrantTarget {
+    address public walletAddr;
+    bytes public reentryPayload;
+    bool public shouldReenter;
+
+    function arm(address _wallet, bytes memory _payload) external {
+        walletAddr = _wallet;
+        reentryPayload = _payload;
+        shouldReenter = true;
+    }
+
+    function doSomething() external payable {
+        if (shouldReenter) {
+            shouldReenter = false;
+            (bool success, ) = walletAddr.call(reentryPayload);
+            require(success, "reentry blocked");
+        }
+    }
+
+    receive() external payable {}
+}
+
+contract AcceptAllTarget {
+    receive() external payable {}
+    fallback() external payable {}
+}
+
 contract FishnetWalletTest is Test {
     FishnetWallet public wallet;
     MockTarget public target;
@@ -123,24 +150,8 @@ contract FishnetWalletTest is Test {
         new FishnetWallet(address(0));
     }
 
-    function test_execute_success() public {
+    function test_executeValidPermit() public {
         bytes memory data = abi.encodeWithSelector(MockTarget.doSomething.selector, 42);
-        uint48 expiry = uint48(block.timestamp + 300);
-        bytes32 policyHash = keccak256("policy-v1");
-
-        FishnetWallet.FishnetPermit memory permit = _buildPermit(
-            address(target), 0, data, 1, expiry, policyHash
-        );
-        bytes memory sig = _signPermit(permit, signerPrivateKey);
-
-        wallet.execute(address(target), 0, data, permit, sig);
-
-        assertEq(target.lastValue(), 42);
-        assertTrue(wallet.usedNonces(1));
-    }
-
-    function test_execute_withValue() public {
-        bytes memory data = abi.encodeWithSelector(MockTarget.doSomething.selector, 99);
         uint48 expiry = uint48(block.timestamp + 300);
         bytes32 policyHash = keccak256("policy-v1");
 
@@ -150,25 +161,37 @@ contract FishnetWalletTest is Test {
         bytes memory sig = _signPermit(permit, signerPrivateKey);
 
         uint256 targetBalBefore = address(target).balance;
+
+        vm.expectEmit(true, false, false, true);
+        emit FishnetWallet.ActionExecuted(address(target), 1 ether, 1, policyHash);
+
         wallet.execute(address(target), 1 ether, data, permit, sig);
 
+        // Target receives call with correct calldata
+        assertEq(target.lastValue(), 42);
+        // Target receives correct ETH value
         assertEq(address(target).balance, targetBalBefore + 1 ether);
+        // Nonce is marked as used
+        assertTrue(wallet.usedNonces(1));
+        // ActionExecuted event verified via vm.expectEmit above
     }
 
-    function test_execute_emitsActionExecuted() public {
-        bytes memory data = abi.encodeWithSelector(MockTarget.doSomething.selector, 1);
+    function test_executeWithZeroValue() public {
+        bytes memory data = abi.encodeWithSelector(MockTarget.doSomething.selector, 99);
         uint48 expiry = uint48(block.timestamp + 300);
         bytes32 policyHash = keccak256("policy-v1");
 
         FishnetWallet.FishnetPermit memory permit = _buildPermit(
-            address(target), 0, data, 7, expiry, policyHash
+            address(target), 0, data, 1, expiry, policyHash
         );
         bytes memory sig = _signPermit(permit, signerPrivateKey);
 
-        vm.expectEmit(true, false, false, true);
-        emit FishnetWallet.ActionExecuted(address(target), 0, 7, policyHash);
-
+        uint256 targetBalBefore = address(target).balance;
         wallet.execute(address(target), 0, data, permit, sig);
+
+        assertEq(target.lastValue(), 99);
+        assertEq(address(target).balance, targetBalBefore);
+        assertTrue(wallet.usedNonces(1));
     }
 
     function test_execute_reverts_permitExpired() public {
@@ -349,35 +372,34 @@ contract FishnetWalletTest is Test {
         wallet.execute(address(target), 0, data, permit, sig);
     }
 
-    function test_differentNonces_bothSucceed() public {
-        bytes memory data = abi.encodeWithSelector(MockTarget.doSomething.selector, 1);
-        uint48 expiry = uint48(block.timestamp + 300);
-        bytes32 policyHash = keccak256("policy-v1");
-
-        FishnetWallet.FishnetPermit memory permit1 = _buildPermit(
-            address(target), 0, data, 1, expiry, policyHash
-        );
-        bytes memory sig1 = _signPermit(permit1, signerPrivateKey);
-        wallet.execute(address(target), 0, data, permit1, sig1);
-
-        FishnetWallet.FishnetPermit memory permit2 = _buildPermit(
-            address(target), 0, data, 2, expiry, policyHash
-        );
-        bytes memory sig2 = _signPermit(permit2, signerPrivateKey);
-        wallet.execute(address(target), 0, data, permit2, sig2);
-
-        assertTrue(wallet.usedNonces(1));
-        assertTrue(wallet.usedNonces(2));
-    }
-
     function test_setSigner() public {
-        address newSigner = address(0x1234);
+        uint256 newSignerKey = 0xC0FFEE;
+        address newSigner = vm.addr(newSignerKey);
 
+        // SignerUpdated event emitted
         vm.expectEmit(true, true, false, false);
         emit FishnetWallet.SignerUpdated(signer, newSigner);
 
         wallet.setSigner(newSigner);
         assertEq(wallet.fishnetSigner(), newSigner);
+
+        bytes memory data = abi.encodeWithSelector(MockTarget.doSomething.selector, 77);
+        uint48 expiry = uint48(block.timestamp + 300);
+        bytes32 policyHash = keccak256("policy-v2");
+
+        FishnetWallet.FishnetPermit memory permit = _buildPermit(
+            address(target), 0, data, 1, expiry, policyHash
+        );
+
+        // Old signer's permits no longer work
+        bytes memory oldSig = _signPermit(permit, signerPrivateKey);
+        vm.expectRevert(FishnetWallet.InvalidSignature.selector);
+        wallet.execute(address(target), 0, data, permit, oldSig);
+
+        // New signer's permits work
+        bytes memory newSig = _signPermit(permit, newSignerKey);
+        wallet.execute(address(target), 0, data, permit, newSig);
+        assertEq(target.lastValue(), 77);
     }
 
     function test_setSigner_reverts_notOwner() public {
@@ -470,30 +492,6 @@ contract FishnetWalletTest is Test {
         assertEq(forkedDS, expected);
     }
 
-    function test_execute_afterSignerRotation() public {
-        uint256 newSignerKey = 0xC0FFEE;
-        address newSigner = vm.addr(newSignerKey);
-
-        wallet.setSigner(newSigner);
-
-        bytes memory data = abi.encodeWithSelector(MockTarget.doSomething.selector, 77);
-        uint48 expiry = uint48(block.timestamp + 300);
-        bytes32 policyHash = keccak256("policy-v2");
-
-        FishnetWallet.FishnetPermit memory permit = _buildPermit(
-            address(target), 0, data, 1, expiry, policyHash
-        );
-
-        bytes memory oldSig = _signPermit(permit, signerPrivateKey);
-        vm.expectRevert(FishnetWallet.InvalidSignature.selector);
-        wallet.execute(address(target), 0, data, permit, oldSig);
-
-        bytes memory newSig = _signPermit(permit, newSignerKey);
-        wallet.execute(address(target), 0, data, permit, newSig);
-
-        assertEq(target.lastValue(), 77);
-    }
-
     function test_execute_afterUnpause() public {
         wallet.pause();
 
@@ -513,5 +511,255 @@ contract FishnetWalletTest is Test {
 
         wallet.execute(address(target), 0, data, permit, sig);
         assertEq(target.lastValue(), 55);
+    }
+
+    // =====================================================================
+    // SC-2 §2: Additional Happy Path Tests
+    // =====================================================================
+
+    function test_executeMultiplePermitsSequentially() public {
+        bytes32 policyHash = keccak256("policy-v1");
+        uint48 expiry = uint48(block.timestamp + 300);
+
+        for (uint256 i = 1; i <= 3; i++) {
+            bytes memory data = abi.encodeWithSelector(MockTarget.doSomething.selector, i * 10);
+
+            FishnetWallet.FishnetPermit memory permit = _buildPermit(
+                address(target), 0, data, i, expiry, policyHash
+            );
+            bytes memory sig = _signPermit(permit, signerPrivateKey);
+
+            vm.expectEmit(true, false, false, true);
+            emit FishnetWallet.ActionExecuted(address(target), 0, i, policyHash);
+
+            wallet.execute(address(target), 0, data, permit, sig);
+            assertTrue(wallet.usedNonces(i));
+        }
+
+        assertEq(target.lastValue(), 30);
+    }
+
+    function test_executeComplexCalldata() public {
+        AcceptAllTarget complexTarget = new AcceptAllTarget();
+
+        // Realistic Uniswap V3 exactInputSingle-like calldata
+        bytes memory complexData = abi.encodeWithSelector(
+            bytes4(0x414bf389), // exactInputSingle selector
+            address(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2), // tokenIn (WETH)
+            address(0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48), // tokenOut (USDC)
+            uint24(3000),                                           // fee
+            address(wallet),                                        // recipient
+            uint256(block.timestamp + 300),                         // deadline
+            uint256(1 ether),                                       // amountIn
+            uint256(2000e6),                                        // amountOutMinimum
+            uint160(0)                                              // sqrtPriceLimitX96
+        );
+        uint48 expiry = uint48(block.timestamp + 300);
+        bytes32 policyHash = keccak256("policy-v1");
+
+        FishnetWallet.FishnetPermit memory permit = _buildPermit(
+            address(complexTarget), 1 ether, complexData, 1, expiry, policyHash
+        );
+        bytes memory sig = _signPermit(permit, signerPrivateKey);
+
+        wallet.execute(address(complexTarget), 1 ether, complexData, permit, sig);
+
+        assertTrue(wallet.usedNonces(1));
+    }
+
+    // =====================================================================
+    // SC-2 §3: Additional Permit Validation Tests
+    // =====================================================================
+
+    function test_revert_zeroAddressSigner() public {
+        bytes memory data = abi.encodeWithSelector(MockTarget.doSomething.selector, 1);
+        uint48 expiry = uint48(block.timestamp + 300);
+        bytes32 policyHash = keccak256("policy-v1");
+
+        FishnetWallet.FishnetPermit memory permit = _buildPermit(
+            address(target), 0, data, 1, expiry, policyHash
+        );
+
+        // Craft signature where ecrecover returns address(0)
+        bytes memory zeroSig = abi.encodePacked(bytes32(0), bytes32(0), uint8(27));
+
+        vm.expectRevert(FishnetWallet.InvalidSignature.selector);
+        wallet.execute(address(target), 0, data, permit, zeroSig);
+    }
+
+    // =====================================================================
+    // SC-2 §6: Edge Case Tests
+    // =====================================================================
+
+    function test_executeExactExpiry() public {
+        bytes memory data = abi.encodeWithSelector(MockTarget.doSomething.selector, 42);
+        uint48 expiry = uint48(block.timestamp); // boundary: expiry == block.timestamp
+        bytes32 policyHash = keccak256("policy-v1");
+
+        FishnetWallet.FishnetPermit memory permit = _buildPermit(
+            address(target), 0, data, 1, expiry, policyHash
+        );
+        bytes memory sig = _signPermit(permit, signerPrivateKey);
+
+        // Should succeed: block.timestamp <= permit.expiry (equal)
+        wallet.execute(address(target), 0, data, permit, sig);
+        assertEq(target.lastValue(), 42);
+    }
+
+    function test_nonceOrdering() public {
+        bytes memory data = abi.encodeWithSelector(MockTarget.doSomething.selector, 1);
+        uint48 expiry = uint48(block.timestamp + 300);
+        bytes32 policyHash = keccak256("policy-v1");
+
+        // Nonces don't need to be sequential
+        uint256[3] memory nonces = [uint256(5), uint256(2), uint256(99)];
+
+        for (uint256 i = 0; i < 3; i++) {
+            FishnetWallet.FishnetPermit memory permit = _buildPermit(
+                address(target), 0, data, nonces[i], expiry, policyHash
+            );
+            bytes memory sig = _signPermit(permit, signerPrivateKey);
+            wallet.execute(address(target), 0, data, permit, sig);
+        }
+
+        assertTrue(wallet.usedNonces(5));
+        assertTrue(wallet.usedNonces(2));
+        assertTrue(wallet.usedNonces(99));
+        assertFalse(wallet.usedNonces(1));
+        assertFalse(wallet.usedNonces(3));
+    }
+
+    function test_reentryProtection() public {
+        ReentrantTarget reentrant = new ReentrantTarget();
+
+        bytes memory data = abi.encodeWithSelector(ReentrantTarget.doSomething.selector);
+        uint48 expiry = uint48(block.timestamp + 300);
+        bytes32 policyHash = keccak256("policy-v1");
+
+        FishnetWallet.FishnetPermit memory permit = _buildPermit(
+            address(reentrant), 0, data, 1, expiry, policyHash
+        );
+        bytes memory sig = _signPermit(permit, signerPrivateKey);
+
+        // Build reentry payload: same execute call with same nonce
+        bytes memory reentryPayload = abi.encodeWithSelector(
+            FishnetWallet.execute.selector,
+            address(reentrant),
+            uint256(0),
+            data,
+            permit,
+            sig
+        );
+        reentrant.arm(address(wallet), reentryPayload);
+
+        // Flow: wallet marks nonce=1 used → calls reentrant.doSomething()
+        // → doSomething() re-enters wallet.execute() with same nonce=1
+        // → inner execute reverts (NonceUsed) → doSomething() reverts
+        // → outer execute reverts (ExecutionFailed)
+        vm.expectRevert(FishnetWallet.ExecutionFailed.selector);
+        wallet.execute(address(reentrant), 0, data, permit, sig);
+    }
+
+    function test_largeNonce() public {
+        bytes memory data = abi.encodeWithSelector(MockTarget.doSomething.selector, 1);
+        uint48 expiry = uint48(block.timestamp + 300);
+        bytes32 policyHash = keccak256("policy-v1");
+
+        uint256 maxNonce = type(uint256).max;
+
+        FishnetWallet.FishnetPermit memory permit = _buildPermit(
+            address(target), 0, data, maxNonce, expiry, policyHash
+        );
+        bytes memory sig = _signPermit(permit, signerPrivateKey);
+
+        wallet.execute(address(target), 0, data, permit, sig);
+
+        assertTrue(wallet.usedNonces(maxNonce));
+        assertEq(target.lastValue(), 1);
+    }
+
+    function test_chainIdMismatch() public {
+        bytes memory data = abi.encodeWithSelector(MockTarget.doSomething.selector, 1);
+        uint48 expiry = uint48(block.timestamp + 300);
+        bytes32 policyHash = keccak256("policy-v1");
+
+        // Permit has correct chainId
+        FishnetWallet.FishnetPermit memory permit = _buildPermit(
+            address(target), 0, data, 1, expiry, policyHash
+        );
+
+        // Sign with wrong domain separator (different chainId)
+        bytes32 wrongDomainSep = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256("Fishnet"),
+                keccak256("1"),
+                uint256(999),
+                address(wallet)
+            )
+        );
+
+        bytes32 structHash = keccak256(
+            abi.encode(
+                PERMIT_TYPEHASH,
+                permit.wallet,
+                permit.chainId,
+                permit.nonce,
+                permit.expiry,
+                permit.target,
+                permit.value,
+                permit.calldataHash,
+                permit.policyHash
+            )
+        );
+
+        bytes32 digest = keccak256(
+            abi.encodePacked("\x19\x01", wrongDomainSep, structHash)
+        );
+
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerPrivateKey, digest);
+        bytes memory sig = abi.encodePacked(r, s, v);
+
+        // Signature recovery produces wrong address because domain separator differs
+        vm.expectRevert(FishnetWallet.InvalidSignature.selector);
+        wallet.execute(address(target), 0, data, permit, sig);
+    }
+
+    // =====================================================================
+    // SC-2 §7: Gas Benchmarks
+    // =====================================================================
+
+    function test_gasExecute() public {
+        bytes memory data = abi.encodeWithSelector(MockTarget.doSomething.selector, 42);
+        uint48 expiry = uint48(block.timestamp + 300);
+        bytes32 policyHash = keccak256("policy-v1");
+
+        FishnetWallet.FishnetPermit memory permit = _buildPermit(
+            address(target), 0, data, 1, expiry, policyHash
+        );
+        bytes memory sig = _signPermit(permit, signerPrivateKey);
+
+        uint256 gasBefore = gasleft();
+        wallet.execute(address(target), 0, data, permit, sig);
+        uint256 gasUsed = gasBefore - gasleft();
+
+        emit log_named_uint("execute() gas used", gasUsed);
+    }
+
+    function test_gasDeniedPermit() public {
+        bytes memory data = abi.encodeWithSelector(MockTarget.doSomething.selector, 1);
+        uint48 expiry = uint48(block.timestamp - 1);
+        bytes32 policyHash = keccak256("policy-v1");
+
+        FishnetWallet.FishnetPermit memory permit = _buildPermit(
+            address(target), 0, data, 1, expiry, policyHash
+        );
+        bytes memory sig = _signPermit(permit, signerPrivateKey);
+
+        uint256 gasBefore = gasleft();
+        try wallet.execute(address(target), 0, data, permit, sig) {} catch {}
+        uint256 gasUsed = gasBefore - gasleft();
+
+        emit log_named_uint("denied permit (expired) gas used", gasUsed);
     }
 }
