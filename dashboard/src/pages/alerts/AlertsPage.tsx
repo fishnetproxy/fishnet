@@ -9,6 +9,7 @@ import { POLLING_INTERVALS } from "@/lib/constants";
 import { useAlertsContext } from "@/context/alerts-context";
 import { AlertRow } from "./AlertRow";
 import { AlertFilters } from "./AlertFilters";
+import { WebhookConfigCard } from "./WebhookConfigCard";
 import type { StatusFilter } from "./AlertFilters";
 import type { AlertType, AlertSeverity } from "@/api/types";
 
@@ -157,6 +158,9 @@ export default function AlertsPage() {
 
   return (
     <div className="space-y-4">
+      {/* Webhook config */}
+      <WebhookConfigCard />
+
       {/* Toolbar: count + bulk actions */}
       <div className="flex items-center justify-between">
         <p className="text-sm text-text-secondary">

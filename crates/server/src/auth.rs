@@ -1,31 +1,26 @@
 use axum::{
+    Json,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    Json,
 };
 use fishnet_types::auth::*;
 
 use crate::state::AppState;
 
-pub async fn status(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let initialized = state.password_store.is_initialized().unwrap_or(false);
 
-    let authenticated = if let Some(auth_header) = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-    {
-        if let Some(token) = auth_header.strip_prefix("Bearer ") {
-            state.session_store.validate(token).await
+    let authenticated =
+        if let Some(auth_header) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+            if let Some(token) = auth_header.strip_prefix("Bearer ") {
+                state.session_store.validate(token).await
+            } else {
+                false
+            }
         } else {
             false
-        }
-    } else {
-        false
-    };
+        };
 
     Json(AuthStatusResponse {
         initialized,
@@ -33,10 +28,7 @@ pub async fn status(
     })
 }
 
-pub async fn setup(
-    State(state): State<AppState>,
-    Json(req): Json<SetupRequest>,
-) -> Response {
+pub async fn setup(State(state): State<AppState>, Json(req): Json<SetupRequest>) -> Response {
     match state.password_store.is_initialized() {
         Ok(true) => {
             return (
@@ -100,10 +92,7 @@ pub async fn setup(
     }
 }
 
-pub async fn login(
-    State(state): State<AppState>,
-    Json(req): Json<LoginRequest>,
-) -> Response {
+pub async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>) -> Response {
     if let Err(retry_after) = state.rate_limiter.check_rate_limit().await {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -149,10 +138,7 @@ pub async fn login(
     }
 }
 
-pub async fn logout(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let token = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())

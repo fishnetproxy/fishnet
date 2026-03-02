@@ -7,8 +7,7 @@ use crate::signer::StubSigner;
 use crate::spend::{ServiceBudget, SpendStore};
 use crate::state::AppState;
 
-const DEV_PRIVATE_KEY: &str =
-    "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+const DEV_PRIVATE_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"; // gitleaks:allow
 
 pub fn dev_config() -> FishnetConfig {
     let mut config = FishnetConfig::default();
@@ -142,7 +141,10 @@ async fn seed_alerts(store: &AlertStore) {
         let _ = store.dismiss(&alert.id).await;
     }
 
-    eprintln!("[fishnet] dev-seed: created {} sample alerts (1 dismissed)", alerts.len());
+    eprintln!(
+        "[fishnet] dev-seed: created {} sample alerts (1 dismissed)",
+        alerts.len()
+    );
 }
 
 async fn seed_spend(store: &SpendStore) {
@@ -220,5 +222,8 @@ async fn seed_budgets(store: &SpendStore) {
         }
     }
 
-    eprintln!("[fishnet] dev-seed: configured {} service budgets", budgets.len());
+    eprintln!(
+        "[fishnet] dev-seed: configured {} service budgets",
+        budgets.len()
+    );
 }

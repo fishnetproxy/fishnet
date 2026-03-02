@@ -1,15 +1,17 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
 use crate::constants;
 use crate::state::AppState;
+
+const USD_MICROS_SCALE: i64 = 1_000_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SpendError {
@@ -17,16 +19,33 @@ pub enum SpendError {
     Db(#[from] rusqlite::Error),
     #[error("task join error: {0}")]
     Join(#[from] tokio::task::JoinError),
+    #[error("invalid spend amount: {0}")]
+    InvalidAmount(String),
+    #[error("state poisoned: {0}")]
+    Poisoned(String),
 }
 
 pub struct SpendStore {
     conn: Arc<Mutex<Connection>>,
 }
 
+fn poison_to_sqlite_error(resource: &str) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(format!(
+        "{resource} mutex is poisoned"
+    ))))
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SpendRecord {
     pub service: String,
     pub date: String,
+    pub cost_usd: f64,
+    pub request_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TodayServiceSpend {
+    pub service: String,
     pub cost_usd: f64,
     pub request_count: i64,
 }
@@ -88,7 +107,7 @@ impl SpendStore {
             std::fs::create_dir_all(parent).ok();
         }
         let conn = Connection::open(&path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
         };
@@ -99,6 +118,7 @@ impl SpendStore {
     #[cfg(test)]
     pub fn open_in_memory() -> Result<Self, rusqlite::Error> {
         let conn = Connection::open_in_memory()?;
+        conn.execute_batch("PRAGMA busy_timeout=5000;")?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
         };
@@ -107,13 +127,17 @@ impl SpendStore {
     }
 
     fn migrate(&self) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| poison_to_sqlite_error("spend database connection"))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS spend_records (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 service TEXT NOT NULL,
                 date TEXT NOT NULL,
                 cost_usd REAL NOT NULL,
+                cost_micros INTEGER NOT NULL DEFAULT 0,
                 request_count INTEGER NOT NULL DEFAULT 1,
                 created_at INTEGER NOT NULL
             );
@@ -152,6 +176,51 @@ impl SpendStore {
             );
             INSERT OR IGNORE INTO nonce_counter (id, value) VALUES (1, 0);",
         )?;
+        Self::ensure_cost_micros_column(&conn)?;
+        Ok(())
+    }
+
+    fn ensure_cost_micros_column(conn: &Connection) -> Result<(), rusqlite::Error> {
+        let mut stmt = conn.prepare("PRAGMA table_info(spend_records)")?;
+        let mut rows = stmt.query([])?;
+        let mut has_cost_micros = false;
+        while let Some(row) = rows.next()? {
+            let column_name: String = row.get(1)?;
+            if column_name == "cost_micros" {
+                has_cost_micros = true;
+                break;
+            }
+        }
+
+        if !has_cost_micros {
+            conn.execute(
+                "ALTER TABLE spend_records ADD COLUMN cost_micros INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+
+        let mut stmt = conn.prepare(
+            "SELECT rowid, cost_usd
+             FROM spend_records
+             WHERE cost_micros = 0 AND cost_usd != 0",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)))?;
+
+        let mut updates: Vec<(i64, i64)> = Vec::new();
+        for row in rows {
+            let (row_id, cost_usd) = row?;
+            let cost_micros = usd_f64_to_micros(cost_usd)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            updates.push((row_id, cost_micros));
+        }
+
+        for (row_id, cost_micros) in updates {
+            conn.execute(
+                "UPDATE spend_records SET cost_micros = ?1 WHERE rowid = ?2",
+                params![cost_micros, row_id],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -161,16 +230,34 @@ impl SpendStore {
         date: &str,
         cost_usd: f64,
     ) -> Result<i64, SpendError> {
+        let cost_micros = usd_f64_to_micros(cost_usd)?;
+        self.record_spend_micros(service, date, cost_micros).await
+    }
+
+    pub async fn record_spend_micros(
+        &self,
+        service: &str,
+        date: &str,
+        cost_micros: i64,
+    ) -> Result<i64, SpendError> {
+        if cost_micros < 0 {
+            return Err(SpendError::InvalidAmount(format!(
+                "{cost_micros} micros is negative"
+            )));
+        }
         let conn = self.conn.clone();
         let service = service.to_string();
         let date = date.to_string();
+        let cost_usd = micros_to_usd_f64(cost_micros);
         tokio::task::spawn_blocking(move || -> Result<_, SpendError> {
-            let conn = conn.lock().unwrap();
+            let conn = conn
+                .lock()
+                .map_err(|_| SpendError::Poisoned("spend database connection".to_string()))?;
             let now = chrono::Utc::now().timestamp();
             conn.execute(
-                "INSERT INTO spend_records (service, date, cost_usd, request_count, created_at)
-                 VALUES (?1, ?2, ?3, 1, ?4)",
-                params![service, date, cost_usd, now],
+                "INSERT INTO spend_records (service, date, cost_usd, cost_micros, request_count, created_at)
+                 VALUES (?1, ?2, ?3, ?4, 1, ?5)",
+                params![service, date, cost_usd, cost_micros, now],
             )?;
             Ok(conn.last_insert_rowid())
         })
@@ -180,7 +267,9 @@ impl SpendStore {
     pub async fn query_spend(&self, days: u32) -> Result<Vec<SpendRecord>, SpendError> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<_, SpendError> {
-            let conn = conn.lock().unwrap();
+            let conn = conn
+                .lock()
+                .map_err(|_| SpendError::Poisoned("spend database connection".to_string()))?;
             let cutoff = chrono::Utc::now()
                 .date_naive()
                 .checked_sub_days(chrono::Days::new(days as u64))
@@ -217,7 +306,9 @@ impl SpendStore {
         let conn = self.conn.clone();
         let service = service.to_string();
         tokio::task::spawn_blocking(move || -> Result<_, SpendError> {
-            let conn = conn.lock().unwrap();
+            let conn = conn
+                .lock()
+                .map_err(|_| SpendError::Poisoned("spend database connection".to_string()))?;
             let today = chrono::Utc::now()
                 .date_naive()
                 .format("%Y-%m-%d")
@@ -232,11 +323,69 @@ impl SpendStore {
         .await?
     }
 
+    pub async fn get_spent_today_micros(&self, service: &str) -> Result<i64, SpendError> {
+        let conn = self.conn.clone();
+        let service = service.to_string();
+        tokio::task::spawn_blocking(move || -> Result<_, SpendError> {
+            let conn = conn
+                .lock()
+                .map_err(|_| SpendError::Poisoned("spend database connection".to_string()))?;
+            let today = chrono::Utc::now()
+                .date_naive()
+                .format("%Y-%m-%d")
+                .to_string();
+            let spent: i64 = conn.query_row(
+                "SELECT COALESCE(SUM(cost_micros), 0) FROM spend_records WHERE service = ?1 AND date = ?2",
+                params![service, today],
+                |row| row.get(0),
+            )?;
+            Ok(spent)
+        })
+        .await?
+    }
+
+    pub async fn today_service_totals(&self) -> Result<Vec<TodayServiceSpend>, SpendError> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<_, SpendError> {
+            let conn = conn
+                .lock()
+                .map_err(|_| SpendError::Poisoned("spend database connection".to_string()))?;
+            let today = chrono::Utc::now()
+                .date_naive()
+                .format("%Y-%m-%d")
+                .to_string();
+            let mut stmt = conn.prepare(
+                "SELECT service, COALESCE(SUM(cost_usd), 0.0), COALESCE(SUM(request_count), 0)
+                 FROM spend_records
+                 WHERE date = ?1
+                 GROUP BY service
+                 ORDER BY service ASC",
+            )?;
+
+            let rows = stmt.query_map(params![today], |row| {
+                Ok(TodayServiceSpend {
+                    service: row.get(0)?,
+                    cost_usd: row.get(1)?,
+                    request_count: row.get(2)?,
+                })
+            })?;
+
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row?);
+            }
+            Ok(results)
+        })
+        .await?
+    }
+
     pub async fn set_budget(&self, budget: &ServiceBudget) -> Result<(), SpendError> {
         let conn = self.conn.clone();
         let budget = budget.clone();
         tokio::task::spawn_blocking(move || -> Result<_, SpendError> {
-            let conn = conn.lock().unwrap();
+            let conn = conn
+                .lock()
+                .map_err(|_| SpendError::Poisoned("spend database connection".to_string()))?;
             conn.execute(
                 "INSERT INTO service_budgets (service, daily_budget_usd, monthly_budget_usd, updated_at)
                  VALUES (?1, ?2, ?3, ?4)
@@ -259,7 +408,9 @@ impl SpendStore {
     pub async fn get_budgets(&self) -> Result<Vec<ServiceBudget>, SpendError> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<_, SpendError> {
-            let conn = conn.lock().unwrap();
+            let conn = conn
+                .lock()
+                .map_err(|_| SpendError::Poisoned("spend database connection".to_string()))?;
             let mut stmt = conn.prepare(
                 "SELECT service, daily_budget_usd, monthly_budget_usd, updated_at FROM service_budgets",
             )?;
@@ -284,7 +435,9 @@ impl SpendStore {
         let conn = self.conn.clone();
         let service = service.to_string();
         tokio::task::spawn_blocking(move || -> Result<_, SpendError> {
-            let conn = conn.lock().unwrap();
+            let conn = conn
+                .lock()
+                .map_err(|_| SpendError::Poisoned("spend database connection".to_string()))?;
             let mut stmt = conn.prepare(
                 "SELECT service, daily_budget_usd, monthly_budget_usd, updated_at
                  FROM service_budgets WHERE service = ?1",
@@ -307,10 +460,7 @@ impl SpendStore {
     }
 
     pub fn default_path() -> Option<PathBuf> {
-        let mut path = dirs::home_dir()?;
-        path.push(constants::FISHNET_DIR);
-        path.push(constants::SPEND_DB_FILE);
-        Some(path)
+        constants::default_data_file(constants::SPEND_DB_FILE)
     }
 
     pub async fn record_permit(&self, entry: &PermitEntry<'_>) -> Result<i64, SpendError> {
@@ -323,7 +473,9 @@ impl SpendStore {
         let permit_hash = entry.permit_hash.map(|s| s.to_string());
         let cost_usd = entry.cost_usd;
         tokio::task::spawn_blocking(move || -> Result<_, SpendError> {
-            let conn = conn.lock().unwrap();
+            let conn = conn
+                .lock()
+                .map_err(|_| SpendError::Poisoned("spend database connection".to_string()))?;
             let now = chrono::Utc::now().timestamp();
             let today = chrono::Utc::now()
                 .date_naive()
@@ -342,7 +494,9 @@ impl SpendStore {
     pub async fn get_onchain_stats(&self) -> Result<OnchainStats, SpendError> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<_, SpendError> {
-            let conn = conn.lock().unwrap();
+            let conn = conn
+                .lock()
+                .map_err(|_| SpendError::Poisoned("spend database connection".to_string()))?;
             let today = chrono::Utc::now()
                 .date_naive()
                 .format("%Y-%m-%d")
@@ -385,7 +539,9 @@ impl SpendStore {
     pub async fn get_onchain_spent_today(&self) -> Result<f64, SpendError> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<_, SpendError> {
-            let conn = conn.lock().unwrap();
+            let conn = conn
+                .lock()
+                .map_err(|_| SpendError::Poisoned("spend database connection".to_string()))?;
             let today = chrono::Utc::now()
                 .date_naive()
                 .format("%Y-%m-%d")
@@ -403,17 +559,18 @@ impl SpendStore {
     pub async fn next_nonce(&self) -> Result<u64, SpendError> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<_, SpendError> {
-            let conn = conn.lock().unwrap();
+            let conn = conn
+                .lock()
+                .map_err(|_| SpendError::Poisoned("spend database connection".to_string()))?;
             let gap = (rand::random::<u64>() % 1024) + 1;
             conn.execute(
                 "UPDATE nonce_counter SET value = value + ?1 WHERE id = 1",
                 params![gap as i64],
             )?;
-            let nonce: i64 = conn.query_row(
-                "SELECT value FROM nonce_counter WHERE id = 1",
-                [],
-                |row| row.get(0),
-            )?;
+            let nonce: i64 =
+                conn.query_row("SELECT value FROM nonce_counter WHERE id = 1", [], |row| {
+                    row.get(0)
+                })?;
             Ok(nonce as u64)
         })
         .await?
@@ -427,7 +584,9 @@ impl SpendStore {
         let conn = self.conn.clone();
         let status_filter = status_filter.map(|s| s.to_string());
         tokio::task::spawn_blocking(move || -> Result<_, SpendError> {
-            let conn = conn.lock().unwrap();
+            let conn = conn
+                .lock()
+                .map_err(|_| SpendError::Poisoned("spend database connection".to_string()))?;
             let cutoff = chrono::Utc::now()
                 .date_naive()
                 .checked_sub_days(chrono::Days::new(days as u64))
@@ -480,6 +639,26 @@ impl SpendStore {
     }
 }
 
+fn micros_to_usd_f64(micros: i64) -> f64 {
+    micros as f64 / USD_MICROS_SCALE as f64
+}
+
+fn usd_f64_to_micros(usd: f64) -> Result<i64, SpendError> {
+    if !usd.is_finite() || usd < 0.0 {
+        return Err(SpendError::InvalidAmount(format!(
+            "{usd} is not a valid non-negative finite USD amount"
+        )));
+    }
+    let scaled = usd * USD_MICROS_SCALE as f64;
+    let max_allowed = (i64::MAX as f64) - 0.5;
+    if !scaled.is_finite() || scaled > max_allowed {
+        return Err(SpendError::InvalidAmount(format!(
+            "{usd} is outside supported range"
+        )));
+    }
+    Ok(scaled.round() as i64)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SpendQuery {
     pub days: Option<u32>,
@@ -502,6 +681,18 @@ pub async fn get_spend(
 
     match state.spend_store.query_spend(days).await {
         Ok(daily) => {
+            let daily_payload: Vec<serde_json::Value> = daily
+                .iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "service": entry.service,
+                        "date": entry.date,
+                        "cost_usd": entry.cost_usd,
+                        "amount": entry.cost_usd,
+                        "request_count": entry.request_count,
+                    })
+                })
+                .collect();
             let budgets = state.spend_store.get_budgets().await.unwrap_or_default();
             let mut budget_map = serde_json::Map::new();
             for b in &budgets {
@@ -512,7 +703,8 @@ pub async fn get_spend(
                     .unwrap_or(0.0);
                 let warning_active = config.llm.budget_warning_pct > 0
                     && b.daily_budget_usd > 0.0
-                    && spent_today >= b.daily_budget_usd * (config.llm.budget_warning_pct as f64 / 100.0);
+                    && spent_today
+                        >= b.daily_budget_usd * (config.llm.budget_warning_pct as f64 / 100.0);
                 budget_map.insert(
                     b.service.clone(),
                     serde_json::json!({
@@ -530,7 +722,7 @@ pub async fn get_spend(
                     "track_spend": config.llm.track_spend,
                     "spend_history_days": config.dashboard.spend_history_days,
                 },
-                "daily": daily,
+                "daily": daily_payload,
                 "budgets": budget_map,
             }))
             .into_response()
@@ -625,12 +817,41 @@ mod tests {
             .to_string();
 
         assert!((store.get_spent_today("openai").await.unwrap() - 0.0).abs() < 0.001);
+        assert_eq!(store.get_spent_today_micros("openai").await.unwrap(), 0);
 
         store.record_spend("openai", &today, 5.25).await.unwrap();
         store.record_spend("openai", &today, 3.75).await.unwrap();
 
         assert!((store.get_spent_today("openai").await.unwrap() - 9.0).abs() < 0.001);
+        assert_eq!(
+            store.get_spent_today_micros("openai").await.unwrap(),
+            9_000_000
+        );
         assert!((store.get_spent_today("anthropic").await.unwrap() - 0.0).abs() < 0.001);
+    }
+
+    #[tokio::test]
+    async fn test_record_spend_micros_uses_exact_integer_math() {
+        let store = SpendStore::open_in_memory().unwrap();
+        let today = chrono::Utc::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+
+        store
+            .record_spend_micros("binance", &today, 123_456)
+            .await
+            .unwrap();
+        store
+            .record_spend_micros("binance", &today, 1_000_001)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.get_spent_today_micros("binance").await.unwrap(),
+            1_123_457
+        );
+        assert!((store.get_spent_today("binance").await.unwrap() - 1.123_457).abs() < 1e-9);
     }
 
     #[tokio::test]

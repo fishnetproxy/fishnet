@@ -5,6 +5,12 @@ export const ROUTES = {
   ALERTS: "/alerts",
   SPEND: "/spend",
   ONCHAIN: "/onchain",
+  WELCOME: "/welcome",
+  DOCS: "/docs",
+  DOCS_GETTING_STARTED: "/docs/getting-started",
+  DOCS_OPENCLAW: "/docs/openclaw",
+  DOCS_POLICIES: "/docs/policies",
+  DOCS_SECURITY: "/docs/security",
 } as const;
 
 export const POLLING_INTERVALS = {

@@ -1,8 +1,8 @@
 use async_trait::async_trait;
+use axum::Json;
 use axum::extract::State;
 use axum::response::IntoResponse;
-use axum::Json;
-use k256::ecdsa::{SigningKey, RecoveryId, signature::hazmat::PrehashSigner};
+use k256::ecdsa::{RecoveryId, SigningKey, signature::hazmat::PrehashSigner};
 use serde::Serialize;
 use sha3::{Digest, Keccak256};
 
@@ -112,8 +112,8 @@ impl StubSigner {
     }
 
     pub fn from_bytes(secret_bytes: [u8; 32]) -> Self {
-        let signing_key = SigningKey::from_bytes((&secret_bytes).into())
-            .expect("valid 32-byte key");
+        let signing_key =
+            SigningKey::from_bytes((&secret_bytes).into()).expect("valid 32-byte key");
         let verifying_key = signing_key.verifying_key();
         let public_key_bytes = verifying_key.to_encoded_point(false);
         let hash = Keccak256::digest(&public_key_bytes.as_bytes()[1..]);
@@ -127,7 +127,7 @@ impl StubSigner {
 
     fn eip712_hash(&self, permit: &FishnetPermit) -> [u8; 32] {
         let domain_type_hash = Keccak256::digest(
-            b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+            b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
         );
         let name_hash = Keccak256::digest(b"Fishnet");
         let version_hash = Keccak256::digest(b"1");
@@ -310,7 +310,6 @@ mod tests {
     #[test]
     fn test_eip712_hash_none_policy_is_zero_bytes() {
         // When policy_hash is None, Rust should encode bytes32(0).
-        // Reference: cast abi-encode with zero policy hash.
         let expected_digest = hex::decode(
             "d61a0eb9e892785d7b2d77d28389cbad95c7d077cfedf6e9fba0d45b1267ef05"
         ).unwrap();
@@ -336,7 +335,6 @@ mod tests {
         let sig = signer.sign_permit(&permit).await.unwrap();
 
         assert_eq!(sig.len(), 65, "Signature must be exactly 65 bytes (r:32 + s:32 + v:1)");
-        // v must be 27 or 28
         let v = sig[64];
         assert!(v == 27 || v == 28, "v byte must be 27 or 28, got {}", v);
     }
@@ -350,12 +348,10 @@ mod tests {
         let sig_bytes = signer.sign_permit(&permit).await.unwrap();
         let digest = signer.eip712_hash(&permit);
 
-        // Extract r, s, v
         let r = &sig_bytes[0..32];
         let s = &sig_bytes[32..64];
         let v = sig_bytes[64];
 
-        // Reconstruct k256 signature and recover
         let mut rs_bytes = [0u8; 64];
         rs_bytes[..32].copy_from_slice(r);
         rs_bytes[32..].copy_from_slice(s);
@@ -367,7 +363,6 @@ mod tests {
         let recovered_key = VerifyingKey::recover_from_prehash(&digest, &signature, recovery_id)
             .expect("recovery should succeed");
 
-        // Derive address from recovered public key
         let pub_bytes = recovered_key.to_encoded_point(false);
         let hash = Keccak256::digest(&pub_bytes.as_bytes()[1..]);
         let mut recovered_address = [0u8; 20];
@@ -383,7 +378,6 @@ mod tests {
 
     #[test]
     fn test_domain_separator_components() {
-        // Verify individual encoding components match cast-computed values
         let domain_type_hash = Keccak256::digest(
             b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
         );
@@ -456,8 +450,6 @@ mod tests {
 
     #[test]
     fn test_nonce_u64_max_passes_validation() {
-        // u64::MAX is valid — just documents that Solidity nonces > u64::MAX
-        // are unreachable from the Rust signer.
         let mut permit = test_permit();
         permit.nonce = u64::MAX;
         assert!(permit.validate().is_ok());
@@ -576,7 +568,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_valid_permit_still_signs_successfully() {
-        // Ensure validation doesn't break the happy path
         let signer = test_signer();
         let permit = test_permit();
         let result = signer.sign_permit(&permit).await;

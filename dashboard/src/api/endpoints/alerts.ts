@@ -6,6 +6,8 @@ import type {
   AlertConfigResponse,
   AlertConfigUpdatePayload,
   AlertConfigUpdateResponse,
+  WebhookConfigResponse,
+  WebhookTestResponse,
 } from "../types";
 
 function buildAlertQuery(params?: AlertsQueryParams): string {
@@ -40,5 +42,22 @@ export function updateAlertConfig(
   return apiFetch<AlertConfigUpdateResponse>("/alerts/config", {
     method: "PUT",
     body: JSON.stringify(payload),
+  });
+}
+
+export function fetchWebhookConfig(): Promise<WebhookConfigResponse> {
+  return apiFetch<WebhookConfigResponse>("/alerts/webhook");
+}
+
+export function updateWebhookConfig(url: string): Promise<WebhookConfigResponse> {
+  return apiFetch<WebhookConfigResponse>("/alerts/webhook", {
+    method: "PUT",
+    body: JSON.stringify({ url }),
+  });
+}
+
+export function testWebhook(): Promise<WebhookTestResponse> {
+  return apiFetch<WebhookTestResponse>("/alerts/webhook/test", {
+    method: "POST",
   });
 }

@@ -42,11 +42,8 @@ impl FilePasswordStore {
         }
     }
 
-    pub fn default_path() -> PathBuf {
-        let mut path = dirs::home_dir().expect("could not determine home directory");
-        path.push(constants::FISHNET_DIR);
-        path.push(constants::AUTH_FILE);
-        path
+    pub fn default_path() -> Option<PathBuf> {
+        constants::default_data_file(constants::AUTH_FILE)
     }
 
     fn hash_password(password: &str) -> String {
@@ -106,7 +103,10 @@ impl PasswordVerifier for FilePasswordStore {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&self.path, fs::Permissions::from_mode(constants::AUTH_FILE_MODE))?;
+            fs::set_permissions(
+                &self.path,
+                fs::Permissions::from_mode(constants::AUTH_FILE_MODE),
+            )?;
         }
 
         let mut cache = self.cache.write().unwrap();

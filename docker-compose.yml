@@ -7,7 +7,7 @@ services:
     ports:
       - "8473:8473"
     volumes:
-      - fishnet-data:/home/fishnet/.fishnet
+      - fishnet-data:/var/lib/fishnet
     restart: unless-stopped
 
 volumes:

@@ -1,0 +1,41 @@
+[binance]
+enabled = true
+base_url = "https://api.binance.com"
+max_order_value_usd = 100.0
+daily_volume_cap_usd = 200.0
+allow_delete_open_orders = false
+recv_window_ms = 5000
+
+[custom.github]
+base_url = "https://api.github.com"
+auth_header = "Authorization"
+auth_value_prefix = "Bearer "
+# Runtime source for the credential value used with auth_header/auth_value_prefix.
+# Example: set `GITHUB_TOKEN` in the environment before starting fishnet.
+auth_value_env = "GITHUB_TOKEN"
+blocked_endpoints = [
+  "DELETE /repos/**",
+  "DELETE /orgs/**",
+  "DELETE /orgs/**/members/**",
+  "DELETE /orgs/**/teams/**",
+  "DELETE /teams/**/members/**",
+  "PUT /repos/**/admin/**",
+]
+rate_limit = 2 # Intentionally conservative safety default for local/demo use; tune per workload.
+rate_limit_window_seconds = 60
+
+[http]
+# Upstream connection timeout.
+connect_timeout_ms = 5000
+# Set to 0 to disable global request timeout (recommended for long streaming responses).
+request_timeout_ms = 0
+# Keep-alive idle timeout for upstream pooled connections.
+pool_idle_timeout_secs = 90
+# Max idle pooled connections per upstream host.
+pool_max_idle_per_host = 16
+# Optional per-upstream pool overrides (keys: openai, anthropic, binance, custom.<name>).
+# [http.upstream_pool_max_idle_per_host]
+# openai = 32
+# anthropic = 24
+# binance = 12
+# "custom.github" = 8
