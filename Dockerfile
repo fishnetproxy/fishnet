@@ -9,7 +9,7 @@ RUN npm run build
 # ── Stage 2: Build Rust backend (with embedded frontend) ────────────
 FROM rust:1.85-slim AS backend-build
 WORKDIR /app
-RUN apt-get update && apt-get install -y pkg-config && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY --from=frontend-build /app/dashboard/dist dashboard/dist
