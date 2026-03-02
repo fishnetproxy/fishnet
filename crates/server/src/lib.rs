@@ -1,4 +1,6 @@
 pub mod alert;
+pub mod anomaly;
+pub mod audit;
 pub mod auth;
 pub mod config;
 pub mod constants;
@@ -16,9 +18,17 @@ pub mod session;
 pub mod signer;
 pub mod spend;
 pub mod state;
+pub mod system;
+pub mod vault;
 pub mod watch;
+pub mod webhook;
 
-use axum::{extract::DefaultBodyLimit, middleware as axum_middleware, routing::{any, get, post}, Router};
+use axum::{
+    Router,
+    extract::DefaultBodyLimit,
+    middleware as axum_middleware,
+    routing::{any, delete, get, post},
+};
 use tower_http::cors::CorsLayer;
 
 use crate::state::AppState;
@@ -31,15 +41,41 @@ pub fn create_router(state: AppState) -> Router {
 
     let protected_routes = Router::new()
         .route("/api/auth/logout", post(auth::logout))
+        .route("/api/status", get(system::status))
+        .route(
+            "/api/policies",
+            get(system::get_policies).put(system::put_policies),
+        )
         .route("/api/alerts", get(alert::list_alerts))
         .route("/api/alerts/dismiss", post(alert::dismiss_alert))
-        .route("/api/alerts/config", get(alert::get_alert_config).put(alert::update_alert_config))
+        .route(
+            "/api/alerts/config",
+            get(alert::get_alert_config).put(alert::update_alert_config),
+        )
+        .route(
+            "/api/alerts/webhook-config",
+            get(webhook::get_webhook_config).post(webhook::update_webhook_config),
+        )
+        .route("/api/alerts/webhook-test", post(webhook::test_webhook))
         .route("/api/spend", get(spend::get_spend))
-        .route("/api/spend/budgets", get(spend::get_budgets).put(spend::set_budget))
+        .route(
+            "/api/spend/budgets",
+            get(spend::get_budgets).put(spend::set_budget),
+        )
+        .route(
+            "/api/credentials",
+            get(vault::list_credentials).post(vault::create_credential),
+        )
+        .route("/api/credentials/{id}", delete(vault::delete_credential))
         .route("/api/signer/status", get(signer::status_handler))
-        .route("/api/onchain/config", get(onchain::get_config).put(onchain::update_config))
+        .route(
+            "/api/onchain/config",
+            get(onchain::get_config).put(onchain::update_config),
+        )
         .route("/api/onchain/stats", get(onchain::get_stats))
         .route("/api/onchain/permits", get(onchain::list_permits))
+        .route("/api/audit", get(audit::list_audit))
+        .route("/api/audit/export", get(audit::export_audit_csv))
         .route("/onchain/submit", post(onchain::submit_handler))
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
@@ -48,6 +84,8 @@ pub fn create_router(state: AppState) -> Router {
 
     let proxy_routes = Router::new()
         .route("/proxy/{provider}/{*rest}", any(proxy::handler))
+        .route("/binance/{*rest}", any(proxy::binance_handler))
+        .route("/custom/{name}/{*rest}", any(proxy::custom_handler))
         .layer(DefaultBodyLimit::max(constants::MAX_BODY_SIZE));
 
     let router = Router::new()
@@ -69,11 +107,15 @@ mod tests {
     use std::sync::Arc;
 
     use axum::body::Body;
-    use axum::http::{Request, StatusCode};
+    use axum::http::{HeaderMap, Request, StatusCode, Uri};
+    use axum::response::IntoResponse;
+    use axum::routing::any as any_route;
+    use axum::{Json, Router as AxumRouter};
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
     use alert::AlertStore;
+    use audit::{AuditStore, NewAuditEntry, merkle};
     use llm_guard::BaselineStore;
     use onchain::OnchainStore;
     use password::FilePasswordStore;
@@ -81,30 +123,51 @@ mod tests {
     use session::SessionStore;
     use signer::StubSigner;
     use spend::SpendStore;
+    use vault::CredentialStore;
 
     fn test_state(dir: &std::path::Path) -> AppState {
-        let (_tx, config_rx) = tokio::sync::watch::channel(
-            Arc::new(fishnet_types::config::FishnetConfig::default()),
-        );
-        AppState {
-            password_store: Arc::new(FilePasswordStore::new(dir.join("auth.json"))),
-            session_store: Arc::new(SessionStore::new()),
-            rate_limiter: Arc::new(LoginRateLimiter::new()),
-            proxy_rate_limiter: Arc::new(ProxyRateLimiter::new()),
+        let (config_tx, config_rx) =
+            tokio::sync::watch::channel(Arc::new(fishnet_types::config::FishnetConfig::default()));
+        let credential_store =
+            Arc::new(CredentialStore::open_in_memory("test-master-password").unwrap());
+        credential_store
+            .insert_plaintext_for_test("openai", "openai-test", "test_openai_key")
+            .unwrap();
+        credential_store
+            .insert_plaintext_for_test("anthropic", "anthropic-test", "test_anthropic_key")
+            .unwrap();
+
+        AppState::new(
+            Arc::new(FilePasswordStore::new(dir.join("auth.json"))),
+            Arc::new(SessionStore::new()),
+            Arc::new(LoginRateLimiter::new()),
+            Arc::new(ProxyRateLimiter::new()),
+            config_tx,
             config_rx,
-            config_path: dir.join("fishnet.toml"),
-            alert_store: Arc::new(AlertStore::open_in_memory().unwrap()),
-            baseline_store: Arc::new(BaselineStore::new()),
-            spend_store: Arc::new(SpendStore::open_in_memory().unwrap()),
-            http_client: reqwest::Client::new(),
-            onchain_store: Arc::new(OnchainStore::new()),
-            signer: Arc::new(StubSigner::new()),
-        }
+            dir.join("fishnet.toml"),
+            Arc::new(AlertStore::open_in_memory().unwrap()),
+            Arc::new(AuditStore::open_in_memory().unwrap()),
+            Arc::new(BaselineStore::new()),
+            Arc::new(SpendStore::open_in_memory().unwrap()),
+            credential_store,
+            Arc::new(tokio::sync::Mutex::new(())),
+            reqwest::Client::new(),
+            std::collections::HashMap::new(),
+            Arc::new(tokio::sync::Mutex::new(anomaly::AnomalyTracker::default())),
+            Arc::new(OnchainStore::new()),
+            Arc::new(StubSigner::new()),
+            std::time::Instant::now(),
+        )
     }
 
     async fn body_json(body: Body) -> serde_json::Value {
         let bytes = body.collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn body_text(body: Body) -> String {
+        let bytes = body.collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&bytes).to_string()
     }
 
     fn status_request() -> Request<Body> {
@@ -154,7 +217,11 @@ mod tests {
         assert_eq!(body["initialized"], false);
         assert_eq!(body["authenticated"], false);
 
-        let resp = app.clone().oneshot(setup_request("test1234")).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(setup_request("test1234"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["success"], true);
@@ -164,7 +231,11 @@ mod tests {
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["initialized"], true);
 
-        let resp = app.clone().oneshot(login_request("test1234")).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(login_request("test1234"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp.into_body()).await;
         let token = body["token"].as_str().unwrap().to_string();
@@ -185,10 +256,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app = create_router(test_state(dir.path()));
 
-        let resp = app.clone().oneshot(setup_request("test1234")).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(setup_request("test1234"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let resp = app.clone().oneshot(setup_request("other123")).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(setup_request("other123"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::CONFLICT);
     }
 
@@ -197,9 +276,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app = create_router(test_state(dir.path()));
 
-        app.clone().oneshot(setup_request("test1234")).await.unwrap();
+        app.clone()
+            .oneshot(setup_request("test1234"))
+            .await
+            .unwrap();
 
-        let resp = app.clone().oneshot(login_request("wrongpwd")).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(login_request("wrongpwd"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["error"], "invalid password");
@@ -210,17 +296,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app = create_router(test_state(dir.path()));
 
-        app.clone().oneshot(setup_request("test1234")).await.unwrap();
+        app.clone()
+            .oneshot(setup_request("test1234"))
+            .await
+            .unwrap();
 
         for _ in 0..5 {
-            let resp = app.clone().oneshot(login_request("wrongpwd")).await.unwrap();
+            let resp = app
+                .clone()
+                .oneshot(login_request("wrongpwd"))
+                .await
+                .unwrap();
             assert!(
                 resp.status() == StatusCode::UNAUTHORIZED
                     || resp.status() == StatusCode::TOO_MANY_REQUESTS
             );
         }
 
-        let resp = app.clone().oneshot(login_request("wrongpwd")).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(login_request("wrongpwd"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         let body = body_json(resp.into_body()).await;
         assert!(body["retry_after_seconds"].is_number());
@@ -248,22 +345,41 @@ mod tests {
     fn test_state_with_config(
         dir: &std::path::Path,
         config: fishnet_types::config::FishnetConfig,
-    ) -> (AppState, tokio::sync::watch::Sender<Arc<fishnet_types::config::FishnetConfig>>) {
+    ) -> (
+        AppState,
+        tokio::sync::watch::Sender<Arc<fishnet_types::config::FishnetConfig>>,
+    ) {
         let (tx, config_rx) = tokio::sync::watch::channel(Arc::new(config));
-        let state = AppState {
-            password_store: Arc::new(FilePasswordStore::new(dir.join("auth.json"))),
-            session_store: Arc::new(SessionStore::new()),
-            rate_limiter: Arc::new(LoginRateLimiter::new()),
-            proxy_rate_limiter: Arc::new(ProxyRateLimiter::new()),
+        let credential_store =
+            Arc::new(CredentialStore::open_in_memory("test-master-password").unwrap());
+        credential_store
+            .insert_plaintext_for_test("openai", "openai-test", "test_openai_key")
+            .unwrap();
+        credential_store
+            .insert_plaintext_for_test("anthropic", "anthropic-test", "test_anthropic_key")
+            .unwrap();
+
+        let state = AppState::new(
+            Arc::new(FilePasswordStore::new(dir.join("auth.json"))),
+            Arc::new(SessionStore::new()),
+            Arc::new(LoginRateLimiter::new()),
+            Arc::new(ProxyRateLimiter::new()),
+            tx.clone(),
             config_rx,
-            config_path: dir.join("fishnet.toml"),
-            alert_store: Arc::new(AlertStore::open_in_memory().unwrap()),
-            baseline_store: Arc::new(BaselineStore::new()),
-            spend_store: Arc::new(SpendStore::open_in_memory().unwrap()),
-            http_client: reqwest::Client::new(),
-            onchain_store: Arc::new(OnchainStore::new()),
-            signer: Arc::new(StubSigner::new()),
-        };
+            dir.join("fishnet.toml"),
+            Arc::new(AlertStore::open_in_memory().unwrap()),
+            Arc::new(AuditStore::open_in_memory().unwrap()),
+            Arc::new(BaselineStore::new()),
+            Arc::new(SpendStore::open_in_memory().unwrap()),
+            credential_store,
+            Arc::new(tokio::sync::Mutex::new(())),
+            reqwest::Client::new(),
+            std::collections::HashMap::new(),
+            Arc::new(tokio::sync::Mutex::new(anomaly::AnomalyTracker::default())),
+            Arc::new(OnchainStore::new()),
+            Arc::new(StubSigner::new()),
+            std::time::Instant::now(),
+        );
         (state, tx)
     }
 
@@ -281,6 +397,90 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap()
+    }
+
+    async fn mock_upstream_handler(
+        headers: HeaderMap,
+        uri: Uri,
+        body: axum::body::Bytes,
+    ) -> Json<serde_json::Value> {
+        let authorization = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let x_mbx_apikey = headers
+            .get("x-mbx-apikey")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        Json(serde_json::json!({
+            "authorization": authorization,
+            "x_mbx_apikey": x_mbx_apikey,
+            "query": uri.query().unwrap_or(""),
+            "body": String::from_utf8_lossy(&body).to_string(),
+        }))
+    }
+
+    async fn spawn_mock_upstream() -> (String, tokio::task::JoinHandle<()>) {
+        let router = AxumRouter::new()
+            .route("/api/v3/order", any_route(mock_upstream_handler))
+            .route("/api/v3/openOrders", any_route(mock_upstream_handler))
+            .route("/api/v3/klines", any_route(mock_upstream_handler))
+            .route("/api/v3/ticker/{*rest}", any_route(mock_upstream_handler))
+            .route("/v1/repos", any_route(mock_upstream_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    async fn spawn_mock_webhook_target() -> (String, tokio::task::JoinHandle<()>) {
+        async fn webhook_handler(_: HeaderMap, _: Uri, _: axum::body::Bytes) -> StatusCode {
+            StatusCode::NO_CONTENT
+        }
+
+        let router = AxumRouter::new().route("/hook", any_route(webhook_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (format!("http://{addr}/hook"), handle)
+    }
+
+    async fn spawn_flaky_webhook_target() -> (String, tokio::task::JoinHandle<()>) {
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&call_count);
+
+        let router = AxumRouter::new().route(
+            "/hook",
+            any_route(move |_: HeaderMap, _: Uri, _: axum::body::Bytes| {
+                let counter = Arc::clone(&counter);
+                async move {
+                    let call_index = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if call_index == 0 {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error":"temporary failure"})),
+                        )
+                            .into_response()
+                    } else {
+                        StatusCode::NO_CONTENT.into_response()
+                    }
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (format!("http://{addr}/hook"), handle)
     }
 
     #[tokio::test]
@@ -305,10 +505,12 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let body = body_json(resp.into_body()).await;
-        assert!(body["error"]
-            .as_str()
-            .unwrap()
-            .contains("System prompt drift detected"));
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("System prompt drift detected")
+        );
 
         let alerts = state.alert_store.list().await.unwrap();
         assert_eq!(alerts.len(), 1);
@@ -428,6 +630,582 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_binance_withdraw_is_hard_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = fishnet_types::config::FishnetConfig::default();
+        config.binance.enabled = true;
+        let (state, _tx) = test_state_with_config(dir.path(), config);
+        let app = create_router(state.clone());
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/binance/sapi/v1/capital/withdraw/apply")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let alerts = state.alert_store.list().await.unwrap();
+        assert!(
+            alerts
+                .iter()
+                .any(|alert| alert.alert_type == alert::AlertType::HighSeverityDeniedAction)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_binance_delete_open_orders_blocked_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = fishnet_types::config::FishnetConfig::default();
+        config.binance.enabled = true;
+        let (state, _tx) = test_state_with_config(dir.path(), config);
+        let app = create_router(state.clone());
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/binance/api/v3/openOrders")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let alerts = state.alert_store.list().await.unwrap();
+        assert!(
+            alerts
+                .iter()
+                .any(|alert| alert.alert_type == alert::AlertType::HighSeverityDeniedAction)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_binance_delete_open_orders_allowed_when_policy_enabled() {
+        let (base_url, mock_handle) = spawn_mock_upstream().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = fishnet_types::config::FishnetConfig::default();
+        config.binance.enabled = true;
+        config.binance.allow_delete_open_orders = true;
+        config.binance.base_url = base_url;
+        let (state, _tx) = test_state_with_config(dir.path(), config);
+        state
+            .credential_store
+            .insert_plaintext_for_test("binance", "api_key", "binance_key_delete")
+            .unwrap();
+        state
+            .credential_store
+            .insert_plaintext_for_test("binance", "api_secret", "binance_secret_delete")
+            .unwrap();
+        let app = create_router(state);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/binance/api/v3/openOrders?symbol=BTCUSDT")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_json(resp.into_body()).await;
+        let query = body["query"].as_str().unwrap();
+        assert_eq!(body["x_mbx_apikey"], "binance_key_delete");
+        assert!(query.contains("symbol=BTCUSDT"));
+        assert!(query.contains("timestamp="));
+        assert!(query.contains("signature="));
+
+        mock_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_binance_read_only_endpoints_allowed_without_credentials() {
+        let (base_url, mock_handle) = spawn_mock_upstream().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = fishnet_types::config::FishnetConfig::default();
+        config.binance.enabled = true;
+        config.binance.base_url = base_url;
+        let (state, _tx) = test_state_with_config(dir.path(), config);
+        let app = create_router(state);
+
+        let ticker_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/binance/api/v3/ticker/price?symbol=BTCUSDT")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ticker_resp.status(), StatusCode::OK);
+        let ticker_body = body_json(ticker_resp.into_body()).await;
+        let ticker_query = ticker_body["query"].as_str().unwrap();
+        assert_eq!(ticker_body["x_mbx_apikey"], "");
+        assert_eq!(ticker_query, "symbol=BTCUSDT");
+        assert!(!ticker_query.contains("signature="));
+
+        let klines_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/binance/api/v3/klines?symbol=BTCUSDT&interval=1m")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(klines_resp.status(), StatusCode::OK);
+        let klines_body = body_json(klines_resp.into_body()).await;
+        let klines_query = klines_body["query"].as_str().unwrap();
+        assert_eq!(klines_body["x_mbx_apikey"], "");
+        assert!(klines_query.contains("symbol=BTCUSDT"));
+        assert!(klines_query.contains("interval=1m"));
+        assert!(!klines_query.contains("signature="));
+
+        mock_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_anomaly_alerts_for_new_endpoint_and_volume_spike() {
+        let (base_url, mock_handle) = spawn_mock_upstream().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = fishnet_types::config::FishnetConfig::default();
+        config.binance.enabled = true;
+        config.binance.base_url = base_url;
+        let (state, _tx) = test_state_with_config(dir.path(), config);
+        let app = create_router(state.clone());
+
+        for _ in 0..12 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/binance/api/v3/ticker/price?symbol=BTCUSDT")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        let alerts = state.alert_store.list().await.unwrap();
+        assert!(
+            alerts
+                .iter()
+                .any(|alert| alert.alert_type == alert::AlertType::NewEndpoint)
+        );
+        assert!(
+            alerts
+                .iter()
+                .any(|alert| alert.alert_type == alert::AlertType::AnomalousVolume)
+        );
+
+        mock_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_binance_order_limit_rejected_before_upstream() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = fishnet_types::config::FishnetConfig::default();
+        config.binance.enabled = true;
+        config.binance.max_order_value_usd = 100.0;
+        let (state, _tx) = test_state_with_config(dir.path(), config);
+
+        state
+            .credential_store
+            .insert_plaintext_for_test("binance", "api_key", "test_key")
+            .unwrap();
+        state
+            .credential_store
+            .insert_plaintext_for_test("binance", "api_secret", "test_secret")
+            .unwrap();
+
+        let app = create_router(state);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/binance/api/v3/order")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("symbol=BTCUSDT&quoteOrderQty=150"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_custom_unknown_service_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let app = create_router(state);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/custom/not-configured/repos")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_custom_blocked_endpoint_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = fishnet_types::config::FishnetConfig::default();
+        config.custom.insert(
+            "github".to_string(),
+            fishnet_types::config::CustomServiceConfig {
+                base_url: "https://api.github.com".to_string(),
+                auth_header: "Authorization".to_string(),
+                auth_value_prefix: "Bearer ".to_string(),
+                auth_value_env: "GITHUB_TOKEN".to_string(),
+                blocked_endpoints: vec!["DELETE /repos/*".to_string()],
+                rate_limit: 100,
+                rate_limit_window_seconds: 3600,
+            },
+        );
+
+        let (state, _tx) = test_state_with_config(dir.path(), config);
+        let app = create_router(state.clone());
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/custom/github/repos/example/fishnet")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let alerts = state.alert_store.list().await.unwrap();
+        assert!(
+            alerts
+                .iter()
+                .any(|alert| alert.alert_type == alert::AlertType::HighSeverityDeniedAction)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_custom_proxy_does_not_fallback_to_first_class_credential() {
+        let (base_url, mock_handle) = spawn_mock_upstream().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = fishnet_types::config::FishnetConfig::default();
+        config.custom.insert(
+            "openai".to_string(),
+            fishnet_types::config::CustomServiceConfig {
+                base_url,
+                auth_header: "Authorization".to_string(),
+                auth_value_prefix: "Bearer ".to_string(),
+                auth_value_env: "OPENAI_TOKEN".to_string(),
+                blocked_endpoints: vec![],
+                rate_limit: 100,
+                rate_limit_window_seconds: 3600,
+            },
+        );
+
+        let (state, _tx) = test_state_with_config(dir.path(), config);
+        let app = create_router(state);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/custom/openai/v1/repos")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body = body_json(resp.into_body()).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("credential not found for custom service: openai")
+        );
+
+        mock_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_custom_proxy_injects_auth_header_to_upstream() {
+        let (base_url, mock_handle) = spawn_mock_upstream().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = fishnet_types::config::FishnetConfig::default();
+        config.custom.insert(
+            "github".to_string(),
+            fishnet_types::config::CustomServiceConfig {
+                base_url,
+                auth_header: "Authorization".to_string(),
+                auth_value_prefix: "Bearer ".to_string(),
+                auth_value_env: "GITHUB_TOKEN".to_string(),
+                blocked_endpoints: vec![],
+                rate_limit: 100,
+                rate_limit_window_seconds: 3600,
+            },
+        );
+        let (state, _tx) = test_state_with_config(dir.path(), config);
+        state
+            .credential_store
+            .insert_plaintext_for_test("custom.github", "token", "ghp_mock")
+            .unwrap();
+        let app = create_router(state);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/custom/github/v1/repos")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["authorization"], "Bearer ghp_mock");
+
+        mock_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_custom_proxy_overrides_client_auth_header_with_vault_key() {
+        let (base_url, mock_handle) = spawn_mock_upstream().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = fishnet_types::config::FishnetConfig::default();
+        config.custom.insert(
+            "github".to_string(),
+            fishnet_types::config::CustomServiceConfig {
+                base_url,
+                auth_header: "Authorization".to_string(),
+                auth_value_prefix: "Bearer ".to_string(),
+                auth_value_env: "GITHUB_TOKEN".to_string(),
+                blocked_endpoints: vec![],
+                rate_limit: 100,
+                rate_limit_window_seconds: 3600,
+            },
+        );
+        let (state, _tx) = test_state_with_config(dir.path(), config);
+        state
+            .credential_store
+            .insert_plaintext_for_test("custom.github", "token", "ghp_vault_value")
+            .unwrap();
+        let app = create_router(state);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/custom/github/v1/repos")
+                    .header("authorization", "Bearer attacker_supplied")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["authorization"], "Bearer ghp_vault_value");
+        assert_ne!(body["authorization"], "Bearer attacker_supplied");
+
+        mock_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_binance_proxy_signs_and_injects_api_key() {
+        let (base_url, mock_handle) = spawn_mock_upstream().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = fishnet_types::config::FishnetConfig::default();
+        config.binance.enabled = true;
+        config.binance.base_url = base_url;
+        config.binance.max_order_value_usd = 1000.0;
+        config.binance.daily_volume_cap_usd = 5000.0;
+        let (state, _tx) = test_state_with_config(dir.path(), config);
+        state
+            .credential_store
+            .insert_plaintext_for_test("binance", "api_key", "binance_key_123")
+            .unwrap();
+        state
+            .credential_store
+            .insert_plaintext_for_test("binance", "api_secret", "binance_secret_456")
+            .unwrap();
+        let app = create_router(state.clone());
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/binance/api/v3/order")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("symbol=BTCUSDT&quoteOrderQty=10"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_json(resp.into_body()).await;
+        let query = body["query"].as_str().unwrap();
+        assert_eq!(body["x_mbx_apikey"], "binance_key_123");
+        assert!(query.contains("symbol=BTCUSDT"));
+        assert!(query.contains("quoteOrderQty=10"));
+        assert!(query.contains("timestamp="));
+        assert!(query.contains("recvWindow="));
+        assert!(query.contains("signature="));
+        assert_eq!(body["body"], "");
+        let spent_today = state.spend_store.get_spent_today("binance").await.unwrap();
+        assert!((spent_today - 10.0).abs() < 1e-9);
+
+        mock_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_binance_daily_volume_cap_enforced_under_concurrency() {
+        let (base_url, mock_handle) = spawn_mock_upstream().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = fishnet_types::config::FishnetConfig::default();
+        config.binance.enabled = true;
+        config.binance.base_url = base_url;
+        config.binance.max_order_value_usd = 1_000.0;
+        config.binance.daily_volume_cap_usd = 15.0;
+        let (state, _tx) = test_state_with_config(dir.path(), config);
+        state
+            .credential_store
+            .insert_plaintext_for_test("binance", "api_key", "binance_key_concurrent")
+            .unwrap();
+        state
+            .credential_store
+            .insert_plaintext_for_test("binance", "api_secret", "binance_secret_concurrent")
+            .unwrap();
+        let app = create_router(state.clone());
+
+        let req1 = Request::builder()
+            .method("POST")
+            .uri("/binance/api/v3/order")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from("symbol=BTCUSDT&quoteOrderQty=10"))
+            .unwrap();
+        let req2 = Request::builder()
+            .method("POST")
+            .uri("/binance/api/v3/order")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from("symbol=BTCUSDT&quoteOrderQty=10"))
+            .unwrap();
+
+        let (resp1, resp2) = tokio::join!(app.clone().oneshot(req1), app.clone().oneshot(req2));
+        let resp1 = resp1.unwrap();
+        let resp2 = resp2.unwrap();
+        let statuses = [resp1.status(), resp2.status()];
+
+        let ok_count = statuses.iter().filter(|s| **s == StatusCode::OK).count();
+        let forbidden_count = statuses
+            .iter()
+            .filter(|s| **s == StatusCode::FORBIDDEN)
+            .count();
+        assert_eq!(ok_count, 1);
+        assert_eq!(forbidden_count, 1);
+
+        let body1 = body_json(resp1.into_body()).await;
+        let body2 = body_json(resp2.into_body()).await;
+        let err1 = body1["error"].as_str().unwrap_or_default();
+        let err2 = body2["error"].as_str().unwrap_or_default();
+        assert!(
+            err1.contains("daily binance volume cap exceeded")
+                || err2.contains("daily binance volume cap exceeded")
+        );
+
+        let spent_today = state.spend_store.get_spent_today("binance").await.unwrap();
+        assert!((spent_today - 10.0).abs() < 1e-9);
+
+        mock_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_binance_proxy_overrides_client_api_key_header() {
+        let (base_url, mock_handle) = spawn_mock_upstream().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = fishnet_types::config::FishnetConfig::default();
+        config.binance.enabled = true;
+        config.binance.base_url = base_url;
+        config.binance.max_order_value_usd = 1000.0;
+        config.binance.daily_volume_cap_usd = 5000.0;
+        let (state, _tx) = test_state_with_config(dir.path(), config);
+        state
+            .credential_store
+            .insert_plaintext_for_test("binance", "api_key", "binance_vault_key")
+            .unwrap();
+        state
+            .credential_store
+            .insert_plaintext_for_test("binance", "api_secret", "binance_vault_secret")
+            .unwrap();
+        let app = create_router(state);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/binance/api/v3/order")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("x-mbx-apikey", "attacker_key")
+                    .body(Body::from("symbol=BTCUSDT&quoteOrderQty=10"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["x_mbx_apikey"], "binance_vault_key");
+        assert_ne!(body["x_mbx_apikey"], "attacker_key");
+
+        mock_handle.abort();
+    }
+
+    #[tokio::test]
     async fn test_proxy_invalid_json_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state(dir.path());
@@ -447,10 +1225,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = body_json(resp.into_body()).await;
-        assert!(body["error"]
-            .as_str()
-            .unwrap()
-            .contains("not valid JSON"));
+        assert!(body["error"].as_str().unwrap().contains("not valid JSON"));
     }
 
     #[tokio::test]
@@ -475,8 +1250,15 @@ mod tests {
     }
 
     async fn setup_and_login(app: &Router) -> String {
-        app.clone().oneshot(setup_request("test1234")).await.unwrap();
-        let resp = app.clone().oneshot(login_request("test1234")).await.unwrap();
+        app.clone()
+            .oneshot(setup_request("test1234"))
+            .await
+            .unwrap();
+        let resp = app
+            .clone()
+            .oneshot(login_request("test1234"))
+            .await
+            .unwrap();
         let body = body_json(resp.into_body()).await;
         body["token"].as_str().unwrap().to_string()
     }
@@ -509,6 +1291,73 @@ mod tests {
             .unwrap()
     }
 
+    fn authed_delete(uri: &str, token: &str) -> Request<Body> {
+        Request::builder()
+            .method("DELETE")
+            .uri(uri)
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_credentials_api_crud_does_not_leak_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = create_router(test_state(dir.path()));
+        let token = setup_and_login(&app).await;
+
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/credentials", &token))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        let credentials = body.as_array().unwrap();
+        assert!(!credentials.is_empty());
+        for credential in credentials {
+            assert!(credential["id"].is_string());
+            assert!(credential["service"].is_string());
+            assert!(credential["name"].is_string());
+            assert!(credential["created_at"].is_number());
+            assert!(credential.get("key").is_none());
+            assert!(credential.get("encrypted_key").is_none());
+        }
+
+        let resp = app
+            .clone()
+            .oneshot(authed_post(
+                "/api/credentials",
+                &token,
+                serde_json::json!({
+                    "service": "custom.github",
+                    "name": "primary",
+                    "key": "ghp_super_secret"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created = body_json(resp.into_body()).await;
+        let created_id = created["id"].as_str().unwrap().to_string();
+        assert_eq!(created["service"], "custom.github");
+        assert_eq!(created["name"], "primary");
+        assert!(created.get("key").is_none());
+        assert!(created.get("encrypted_key").is_none());
+
+        let resp = app
+            .clone()
+            .oneshot(authed_delete(
+                &format!("/api/credentials/{created_id}"),
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["deleted"], true);
+    }
+
     #[tokio::test]
     async fn test_alerts_require_auth() {
         let dir = tempfile::tempdir().unwrap();
@@ -516,7 +1365,12 @@ mod tests {
 
         let resp = app
             .clone()
-            .oneshot(Request::builder().uri("/api/alerts").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/alerts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -528,7 +1382,11 @@ mod tests {
         let app = create_router(test_state(dir.path()));
         let token = setup_and_login(&app).await;
 
-        let resp = app.clone().oneshot(authed_get("/api/alerts", &token)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/alerts", &token))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["alerts"].as_array().unwrap().len(), 0);
@@ -541,16 +1399,32 @@ mod tests {
         let app = create_router(state.clone());
         let token = setup_and_login(&app).await;
 
-        state.alert_store.create(
-            alert::AlertType::PromptDrift, alert::AlertSeverity::Critical,
-            "openai", "drift detected".to_string(),
-        ).await.unwrap();
-        state.alert_store.create(
-            alert::AlertType::PromptSize, alert::AlertSeverity::Warning,
-            "anthropic", "too big".to_string(),
-        ).await.unwrap();
+        state
+            .alert_store
+            .create(
+                alert::AlertType::PromptDrift,
+                alert::AlertSeverity::Critical,
+                "openai",
+                "drift detected".to_string(),
+            )
+            .await
+            .unwrap();
+        state
+            .alert_store
+            .create(
+                alert::AlertType::PromptSize,
+                alert::AlertSeverity::Warning,
+                "anthropic",
+                "too big".to_string(),
+            )
+            .await
+            .unwrap();
 
-        let resp = app.clone().oneshot(authed_get("/api/alerts", &token)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/alerts", &token))
+            .await
+            .unwrap();
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["alerts"].as_array().unwrap().len(), 2);
 
@@ -559,32 +1433,53 @@ mod tests {
         assert_eq!(body["alerts"][1]["service"], "anthropic");
         assert_eq!(body["alerts"][1]["type"], "prompt_size");
 
-        let resp = app.clone().oneshot(authed_get("/api/alerts?type=prompt_drift", &token)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/alerts?type=prompt_drift", &token))
+            .await
+            .unwrap();
         let body = body_json(resp.into_body()).await;
         let alerts = body["alerts"].as_array().unwrap();
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0]["type"], "prompt_drift");
 
-        let resp = app.clone().oneshot(authed_get("/api/alerts?dismissed=false", &token)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/alerts?dismissed=false", &token))
+            .await
+            .unwrap();
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["alerts"].as_array().unwrap().len(), 2);
 
         let alert_id = "alert_001";
-        let resp = app.clone().oneshot(authed_post(
-            "/api/alerts/dismiss", &token,
-            serde_json::json!({"id": alert_id}),
-        )).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_post(
+                "/api/alerts/dismiss",
+                &token,
+                serde_json::json!({"id": alert_id}),
+            ))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["success"], true);
 
-        let resp = app.clone().oneshot(authed_get("/api/alerts?dismissed=true", &token)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/alerts?dismissed=true", &token))
+            .await
+            .unwrap();
         let body = body_json(resp.into_body()).await;
         let alerts = body["alerts"].as_array().unwrap();
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0]["dismissed"], true);
 
-        let resp = app.clone().oneshot(authed_get("/api/alerts?dismissed=false", &token)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/alerts?dismissed=false", &token))
+            .await
+            .unwrap();
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["alerts"].as_array().unwrap().len(), 1);
     }
@@ -597,25 +1492,47 @@ mod tests {
         let token = setup_and_login(&app).await;
 
         for i in 0..5 {
-            state.alert_store.create(
-                alert::AlertType::PromptDrift, alert::AlertSeverity::Warning,
-                "openai", format!("alert {i}"),
-            ).await.unwrap();
+            state
+                .alert_store
+                .create(
+                    alert::AlertType::PromptDrift,
+                    alert::AlertSeverity::Warning,
+                    "openai",
+                    format!("alert {i}"),
+                )
+                .await
+                .unwrap();
         }
 
-        let resp = app.clone().oneshot(authed_get("/api/alerts?limit=2", &token)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/alerts?limit=2", &token))
+            .await
+            .unwrap();
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["alerts"].as_array().unwrap().len(), 2);
 
-        let resp = app.clone().oneshot(authed_get("/api/alerts?skip=3", &token)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/alerts?skip=3", &token))
+            .await
+            .unwrap();
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["alerts"].as_array().unwrap().len(), 2);
 
-        let resp = app.clone().oneshot(authed_get("/api/alerts?skip=2&limit=2", &token)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/alerts?skip=2&limit=2", &token))
+            .await
+            .unwrap();
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["alerts"].as_array().unwrap().len(), 2);
 
-        let resp = app.clone().oneshot(authed_get("/api/alerts?skip=100", &token)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/alerts?skip=100", &token))
+            .await
+            .unwrap();
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["alerts"].as_array().unwrap().len(), 0);
     }
@@ -626,10 +1543,15 @@ mod tests {
         let app = create_router(test_state(dir.path()));
         let token = setup_and_login(&app).await;
 
-        let resp = app.clone().oneshot(authed_post(
-            "/api/alerts/dismiss", &token,
-            serde_json::json!({"id": "alert_999"}),
-        )).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_post(
+                "/api/alerts/dismiss",
+                &token,
+                serde_json::json!({"id": "alert_999"}),
+            ))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -639,7 +1561,11 @@ mod tests {
         let app = create_router(test_state(dir.path()));
         let token = setup_and_login(&app).await;
 
-        let resp = app.clone().oneshot(authed_get("/api/alerts/config", &token)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/alerts/config", &token))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp.into_body()).await;
 
@@ -662,10 +1588,15 @@ mod tests {
         let config_path = dir.path().join("fishnet.toml");
         std::fs::write(&config_path, "").unwrap();
 
-        let resp = app.clone().oneshot(authed_put(
-            "/api/alerts/config", &token,
-            serde_json::json!({"prompt_drift": false}),
-        )).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_put(
+                "/api/alerts/config",
+                &token,
+                serde_json::json!({"prompt_drift": false}),
+            ))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["success"], true);
@@ -680,13 +1611,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_webhook_config_and_test_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = create_router(test_state(dir.path()));
+        let token = setup_and_login(&app).await;
+        let (hook_url, hook_handle) = spawn_mock_webhook_target().await;
+
+        let resp = app
+            .clone()
+            .oneshot(authed_post(
+                "/api/alerts/webhook-config",
+                &token,
+                serde_json::json!({ "discord_url": hook_url }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["saved"], true);
+        assert_eq!(body["discord_configured"], true);
+
+        let resp = app
+            .clone()
+            .oneshot(authed_post(
+                "/api/alerts/webhook-test",
+                &token,
+                serde_json::json!({ "provider": "discord", "message": "ping" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["configured_any"], true);
+        assert_eq!(body["results"][0]["provider"], "discord");
+        assert_eq!(body["results"][0]["sent"], true);
+
+        hook_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_webhook_config_clear_with_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = create_router(test_state(dir.path()));
+        let token = setup_and_login(&app).await;
+        let (hook_url, hook_handle) = spawn_mock_webhook_target().await;
+
+        let resp = app
+            .clone()
+            .oneshot(authed_post(
+                "/api/alerts/webhook-config",
+                &token,
+                serde_json::json!({ "discord_url": hook_url }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .clone()
+            .oneshot(authed_post(
+                "/api/alerts/webhook-config",
+                &token,
+                serde_json::json!({ "discord_url": null }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["discord_configured"], false);
+
+        hook_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_webhook_test_retries_after_temporary_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = create_router(test_state(dir.path()));
+        let token = setup_and_login(&app).await;
+        let (hook_url, hook_handle) = spawn_flaky_webhook_target().await;
+
+        let resp = app
+            .clone()
+            .oneshot(authed_post(
+                "/api/alerts/webhook-config",
+                &token,
+                serde_json::json!({ "discord_url": hook_url }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .clone()
+            .oneshot(authed_post(
+                "/api/alerts/webhook-test",
+                &token,
+                serde_json::json!({ "provider": "discord", "message": "retry me" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["results"][0]["sent"], true);
+
+        hook_handle.abort();
+    }
+
+    #[tokio::test]
     async fn test_spend_requires_auth() {
         let dir = tempfile::tempdir().unwrap();
         let app = create_router(test_state(dir.path()));
 
         let resp = app
             .clone()
-            .oneshot(Request::builder().uri("/api/spend").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/spend")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -701,7 +1746,11 @@ mod tests {
         let app = create_router(state);
         let token = setup_and_login(&app).await;
 
-        let resp = app.clone().oneshot(authed_get("/api/spend", &token)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/spend", &token))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["enabled"], false);
@@ -714,7 +1763,11 @@ mod tests {
         let app = create_router(test_state(dir.path()));
         let token = setup_and_login(&app).await;
 
-        let resp = app.clone().oneshot(authed_get("/api/spend", &token)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/spend", &token))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["enabled"], true);
@@ -730,11 +1783,26 @@ mod tests {
         let app = create_router(state.clone());
         let token = setup_and_login(&app).await;
 
-        let today = chrono::Utc::now().date_naive().format("%Y-%m-%d").to_string();
-        state.spend_store.record_spend("openai", &today, 4.20).await.unwrap();
-        state.spend_store.record_spend("anthropic", &today, 1.80).await.unwrap();
+        let today = chrono::Utc::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        state
+            .spend_store
+            .record_spend("openai", &today, 4.20)
+            .await
+            .unwrap();
+        state
+            .spend_store
+            .record_spend("anthropic", &today, 1.80)
+            .await
+            .unwrap();
 
-        let resp = app.clone().oneshot(authed_get("/api/spend", &token)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/spend", &token))
+            .await
+            .unwrap();
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["enabled"], true);
         assert_eq!(body["daily"].as_array().unwrap().len(), 2);
@@ -749,7 +1817,11 @@ mod tests {
         let app = create_router(state.clone());
         let token = setup_and_login(&app).await;
 
-        let resp = app.clone().oneshot(authed_get("/api/spend?days=365", &token)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/spend?days=365", &token))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -759,41 +1831,63 @@ mod tests {
         let app = create_router(test_state(dir.path()));
         let token = setup_and_login(&app).await;
 
-        let resp = app.clone().oneshot(authed_get("/api/spend/budgets", &token)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/spend/budgets", &token))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["budgets"].as_array().unwrap().len(), 0);
 
-        let resp = app.clone().oneshot(authed_put(
-            "/api/spend/budgets", &token,
-            serde_json::json!({
-                "service": "openai",
-                "daily_budget_usd": 20.0,
-                "monthly_budget_usd": 500.0
-            }),
-        )).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_put(
+                "/api/spend/budgets",
+                &token,
+                serde_json::json!({
+                    "service": "openai",
+                    "daily_budget_usd": 20.0,
+                    "monthly_budget_usd": 500.0
+                }),
+            ))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["success"], true);
         assert_eq!(body["budget"]["service"], "openai");
         assert_eq!(body["budget"]["daily_budget_usd"], 20.0);
 
-        let resp = app.clone().oneshot(authed_get("/api/spend/budgets", &token)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/spend/budgets", &token))
+            .await
+            .unwrap();
         let body = body_json(resp.into_body()).await;
         let budgets = body["budgets"].as_array().unwrap();
         assert_eq!(budgets.len(), 1);
         assert_eq!(budgets[0]["service"], "openai");
 
-        let resp = app.clone().oneshot(authed_put(
-            "/api/spend/budgets", &token,
-            serde_json::json!({
-                "service": "openai",
-                "daily_budget_usd": 30.0
-            }),
-        )).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_put(
+                "/api/spend/budgets",
+                &token,
+                serde_json::json!({
+                    "service": "openai",
+                    "daily_budget_usd": 30.0
+                }),
+            ))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let resp = app.clone().oneshot(authed_get("/api/spend/budgets", &token)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/spend/budgets", &token))
+            .await
+            .unwrap();
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["budgets"][0]["daily_budget_usd"], 30.0);
     }
@@ -807,17 +1901,32 @@ mod tests {
         let app = create_router(state.clone());
         let token = setup_and_login(&app).await;
 
-        state.spend_store.set_budget(&spend::ServiceBudget {
-            service: "openai".to_string(),
-            daily_budget_usd: 10.0,
-            monthly_budget_usd: None,
-            updated_at: 0,
-        }).await.unwrap();
+        state
+            .spend_store
+            .set_budget(&spend::ServiceBudget {
+                service: "openai".to_string(),
+                daily_budget_usd: 10.0,
+                monthly_budget_usd: None,
+                updated_at: 0,
+            })
+            .await
+            .unwrap();
 
-        let today = chrono::Utc::now().date_naive().format("%Y-%m-%d").to_string();
-        state.spend_store.record_spend("openai", &today, 9.0).await.unwrap();
+        let today = chrono::Utc::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        state
+            .spend_store
+            .record_spend("openai", &today, 9.0)
+            .await
+            .unwrap();
 
-        let resp = app.clone().oneshot(authed_get("/api/spend", &token)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/spend", &token))
+            .await
+            .unwrap();
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["budgets"]["openai"]["warning_active"], true);
         assert_eq!(body["budgets"]["openai"]["daily_limit"], 10.0);
@@ -833,17 +1942,32 @@ mod tests {
         let app = create_router(state.clone());
         let token = setup_and_login(&app).await;
 
-        state.spend_store.set_budget(&spend::ServiceBudget {
-            service: "openai".to_string(),
-            daily_budget_usd: 10.0,
-            monthly_budget_usd: None,
-            updated_at: 0,
-        }).await.unwrap();
+        state
+            .spend_store
+            .set_budget(&spend::ServiceBudget {
+                service: "openai".to_string(),
+                daily_budget_usd: 10.0,
+                monthly_budget_usd: None,
+                updated_at: 0,
+            })
+            .await
+            .unwrap();
 
-        let today = chrono::Utc::now().date_naive().format("%Y-%m-%d").to_string();
-        state.spend_store.record_spend("openai", &today, 9.0).await.unwrap();
+        let today = chrono::Utc::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        state
+            .spend_store
+            .record_spend("openai", &today, 9.0)
+            .await
+            .unwrap();
 
-        let resp = app.clone().oneshot(authed_get("/api/spend", &token)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/spend", &token))
+            .await
+            .unwrap();
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["budgets"]["openai"]["warning_active"], false);
     }
@@ -878,7 +2002,11 @@ mod tests {
         assert!(body["error"].as_str().unwrap().contains("rate limit"));
 
         let alerts = state.alert_store.list().await.unwrap();
-        assert!(alerts.iter().any(|a| a.alert_type == alert::AlertType::RateLimitHit));
+        assert!(
+            alerts
+                .iter()
+                .any(|a| a.alert_type == alert::AlertType::RateLimitHit)
+        );
     }
 
     #[tokio::test]
@@ -912,9 +2040,16 @@ mod tests {
         let (state, _tx) = test_state_with_config(dir.path(), config);
         let app = create_router(state.clone());
 
-        app.clone().oneshot(openai_proxy_request("hello", "Hi")).await.unwrap();
+        app.clone()
+            .oneshot(openai_proxy_request("hello", "Hi"))
+            .await
+            .unwrap();
 
-        let resp = app.clone().oneshot(openai_proxy_request("hello", "Hi")).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(openai_proxy_request("hello", "Hi"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
 
         assert!(state.alert_store.list().await.unwrap().is_empty());
@@ -929,9 +2064,16 @@ mod tests {
         let (state, _tx) = test_state_with_config(dir.path(), config);
         let app = create_router(state.clone());
 
-        app.clone().oneshot(openai_proxy_request("You are helpful.", "Hi")).await.unwrap();
+        app.clone()
+            .oneshot(openai_proxy_request("You are helpful.", "Hi"))
+            .await
+            .unwrap();
 
-        let resp = app.clone().oneshot(openai_proxy_request("You are evil.", "Hi")).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(openai_proxy_request("You are evil.", "Hi"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
         assert!(state.alert_store.list().await.unwrap().is_empty());
@@ -949,7 +2091,11 @@ mod tests {
         let app = create_router(state.clone());
 
         let big_content = "x".repeat(500);
-        let resp = app.clone().oneshot(openai_proxy_request(&big_content, "Hi")).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(openai_proxy_request(&big_content, "Hi"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
         assert!(state.alert_store.list().await.unwrap().is_empty());
@@ -969,7 +2115,13 @@ mod tests {
         config
     }
 
-    fn onchain_submit_request(target: &str, calldata: &str, value: &str, chain_id: u64, token: &str) -> Request<Body> {
+    fn onchain_submit_request(
+        target: &str,
+        calldata: &str,
+        value: &str,
+        chain_id: u64,
+        token: &str,
+    ) -> Request<Body> {
         let body = serde_json::json!({
             "target": target,
             "calldata": calldata,
@@ -1043,7 +2195,11 @@ mod tests {
         let app = create_router(test_state(dir.path()));
         let token = setup_and_login(&app).await;
 
-        let resp = app.clone().oneshot(authed_get("/api/signer/status", &token)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/signer/status", &token))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["enabled"], false);
@@ -1059,7 +2215,11 @@ mod tests {
         let app = create_router(state);
         let token = setup_and_login(&app).await;
 
-        let resp = app.clone().oneshot(authed_get("/api/signer/status", &token)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/signer/status", &token))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["enabled"], true);
@@ -1289,15 +2449,19 @@ mod tests {
         let app = create_router(state.clone());
         let token = setup_and_login(&app).await;
 
-        state.spend_store.record_permit(&spend::PermitEntry {
-            chain_id: 8453,
-            target: "0x3fC9",
-            value: "450",
-            status: "approved",
-            reason: None,
-            permit_hash: None,
-            cost_usd: 450.0,
-        }).await.unwrap();
+        state
+            .spend_store
+            .record_permit(&spend::PermitEntry {
+                chain_id: 8453,
+                target: "0x3fC9",
+                value: "450",
+                status: "approved",
+                reason: None,
+                permit_hash: None,
+                cost_usd: 450.0,
+            })
+            .await
+            .unwrap();
 
         let resp = app
             .clone()
@@ -1455,7 +2619,12 @@ mod tests {
             .unwrap();
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["status"], "approved");
-        assert!(body["permit"]["policyHash"].as_str().unwrap().starts_with("0x"));
+        assert!(
+            body["permit"]["policyHash"]
+                .as_str()
+                .unwrap()
+                .starts_with("0x")
+        );
     }
 
     #[tokio::test]
@@ -1588,7 +2757,11 @@ mod tests {
             .await
             .unwrap();
 
-        let resp = app.clone().oneshot(authed_get("/api/signer/status", &token)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/signer/status", &token))
+            .await
+            .unwrap();
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["stats"]["total_permits_signed"], 1);
         assert_eq!(body["stats"]["total_permits_denied"], 1);
@@ -1604,7 +2777,11 @@ mod tests {
         let app = create_router(state);
         let token = setup_and_login(&app).await;
 
-        let resp = app.clone().oneshot(authed_get("/api/onchain/config", &token)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/onchain/config", &token))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["enabled"], true);
@@ -1622,10 +2799,15 @@ mod tests {
         let config_path = dir.path().join("fishnet.toml");
         std::fs::write(&config_path, "").unwrap();
 
-        let resp = app.clone().oneshot(authed_put(
-            "/api/onchain/config", &token,
-            serde_json::json!({"cooldown_seconds": 120}),
-        )).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_put(
+                "/api/onchain/config",
+                &token,
+                serde_json::json!({"cooldown_seconds": 120}),
+            ))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["success"], true);
@@ -1644,48 +2826,89 @@ mod tests {
         let config_path = dir.path().join("fishnet.toml");
         std::fs::write(&config_path, "").unwrap();
 
-        let resp = app.clone().oneshot(authed_put(
-            "/api/onchain/config", &token,
-            serde_json::json!({"max_tx_value_usd": -10.0}),
-        )).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_put(
+                "/api/onchain/config",
+                &token,
+                serde_json::json!({"max_tx_value_usd": -10.0}),
+            ))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = body_json(resp.into_body()).await;
-        assert!(body["errors"].as_array().unwrap().iter().any(|e| e.as_str().unwrap().contains("max_tx_value_usd")));
+        assert!(
+            body["errors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e.as_str().unwrap().contains("max_tx_value_usd"))
+        );
 
-        let resp = app.clone().oneshot(authed_put(
-            "/api/onchain/config", &token,
-            serde_json::json!({"daily_spend_cap_usd": -1.0}),
-        )).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_put(
+                "/api/onchain/config",
+                &token,
+                serde_json::json!({"daily_spend_cap_usd": -1.0}),
+            ))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-        let resp = app.clone().oneshot(authed_put(
-            "/api/onchain/config", &token,
-            serde_json::json!({"max_slippage_bps": 10001}),
-        )).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_put(
+                "/api/onchain/config",
+                &token,
+                serde_json::json!({"max_slippage_bps": 10001}),
+            ))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-        let resp = app.clone().oneshot(authed_put(
-            "/api/onchain/config", &token,
-            serde_json::json!({"max_leverage": 0}),
-        )).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_put(
+                "/api/onchain/config",
+                &token,
+                serde_json::json!({"max_leverage": 0}),
+            ))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-        let resp = app.clone().oneshot(authed_put(
-            "/api/onchain/config", &token,
-            serde_json::json!({"cooldown_seconds": 86401}),
-        )).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_put(
+                "/api/onchain/config",
+                &token,
+                serde_json::json!({"cooldown_seconds": 86401}),
+            ))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-        let resp = app.clone().oneshot(authed_put(
-            "/api/onchain/config", &token,
-            serde_json::json!({"expiry_seconds": 10}),
-        )).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_put(
+                "/api/onchain/config",
+                &token,
+                serde_json::json!({"expiry_seconds": 10}),
+            ))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-        let resp = app.clone().oneshot(authed_put(
-            "/api/onchain/config", &token,
-            serde_json::json!({"max_tx_value_usd": -5.0, "max_slippage_bps": 99999}),
-        )).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_put(
+                "/api/onchain/config",
+                &token,
+                serde_json::json!({"max_tx_value_usd": -5.0, "max_slippage_bps": 99999}),
+            ))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["errors"].as_array().unwrap().len(), 2);
@@ -1710,7 +2933,11 @@ mod tests {
             .await
             .unwrap();
 
-        let resp = app.clone().oneshot(authed_get("/api/onchain/permits", &token)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/onchain/permits", &token))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp.into_body()).await;
         let permits = body["permits"].as_array().unwrap();
@@ -1748,11 +2975,19 @@ mod tests {
             .await
             .unwrap();
 
-        let resp = app.clone().oneshot(authed_get("/api/onchain/permits?status=approved", &token)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/onchain/permits?status=approved", &token))
+            .await
+            .unwrap();
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["permits"].as_array().unwrap().len(), 1);
 
-        let resp = app.clone().oneshot(authed_get("/api/onchain/permits?status=denied", &token)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/onchain/permits?status=denied", &token))
+            .await
+            .unwrap();
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["permits"].as_array().unwrap().len(), 1);
     }
@@ -1765,7 +3000,11 @@ mod tests {
         let app = create_router(state);
         let token = setup_and_login(&app).await;
 
-        let resp = app.clone().oneshot(authed_get("/api/onchain/stats", &token)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/onchain/stats", &token))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["total_permits_signed"], 0);
@@ -1779,7 +3018,12 @@ mod tests {
 
         let resp = app
             .clone()
-            .oneshot(Request::builder().uri("/api/signer/status").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/signer/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -1894,7 +3138,13 @@ mod tests {
 
         let resp = app
             .clone()
-            .oneshot(onchain_submit_request("0x1234", &valid_calldata(), "0", 8453, &token))
+            .oneshot(onchain_submit_request(
+                "0x1234",
+                &valid_calldata(),
+                "0",
+                8453,
+                &token,
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -1979,5 +3229,138 @@ mod tests {
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["status"], "approved");
         assert_eq!(body["permit"]["value"], large_value);
+    }
+
+    #[tokio::test]
+    async fn test_status_endpoint_returns_runtime_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let today = chrono::Utc::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+
+        state
+            .spend_store
+            .record_spend("openai", &today, 1.25)
+            .await
+            .unwrap();
+        state
+            .audit_store
+            .append(NewAuditEntry {
+                intent_type: "api_call".to_string(),
+                service: "openai".to_string(),
+                action: "POST /v1/chat/completions".to_string(),
+                decision: "approved".to_string(),
+                reason: None,
+                cost_usd: Some(1.25),
+                policy_version_hash: merkle::keccak256(b"policy"),
+                intent_hash: merkle::keccak256(b"intent"),
+                permit_hash: None,
+            })
+            .await
+            .unwrap();
+
+        let app = create_router(state);
+        let token = setup_and_login(&app).await;
+
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/status", &token))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["running"], true);
+        assert!(!body["uptime"].as_str().unwrap_or_default().is_empty());
+        assert!(body["today_spend"]["openai"].as_f64().unwrap_or(0.0) >= 1.25);
+        assert!(body["today_requests"]["openai"].as_u64().unwrap_or(0) >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_policies_put_and_get() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let app = create_router(state.clone());
+        let token = setup_and_login(&app).await;
+
+        let mut updated = (*state.config()).clone();
+        updated.llm.allowed_models = vec!["gpt-4o".to_string()];
+
+        let resp = app
+            .clone()
+            .oneshot(authed_put(
+                "/api/policies",
+                &token,
+                serde_json::to_value(updated).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["saved"], true);
+        assert!(
+            body["policy_hash"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("0x")
+        );
+        let persisted = crate::config::load_config(Some(&state.config_path)).unwrap();
+        assert_eq!(persisted.llm.allowed_models, vec!["gpt-4o".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_audit_query_and_export_endpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+
+        for i in 0..3 {
+            state
+                .audit_store
+                .append(NewAuditEntry {
+                    intent_type: "api_call".to_string(),
+                    service: "openai".to_string(),
+                    action: format!("POST /v1/chat/completions/{i}"),
+                    decision: "approved".to_string(),
+                    reason: None,
+                    cost_usd: Some(0.1),
+                    policy_version_hash: merkle::keccak256(b"policy"),
+                    intent_hash: merkle::keccak256(format!("intent-{i}").as_bytes()),
+                    permit_hash: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let app = create_router(state);
+        let token = setup_and_login(&app).await;
+
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/audit?page=1&page_size=2", &token))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["total"], 3);
+        assert_eq!(body["entries"].as_array().unwrap().len(), 2);
+
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/api/audit/export", &token))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default(),
+            "text/csv; charset=utf-8"
+        );
+        let csv = body_text(resp.into_body()).await;
+        assert!(
+            csv.starts_with("id,timestamp,intent_type,service,action,decision,reason,cost_usd")
+        );
     }
 }

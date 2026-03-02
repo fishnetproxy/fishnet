@@ -1,19 +1,15 @@
 use axum::{
+    Json,
     extract::{Request, State},
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
-    Json,
 };
 use fishnet_types::auth::ErrorResponse;
 
 use crate::state::AppState;
 
-pub async fn require_auth(
-    State(state): State<AppState>,
-    request: Request,
-    next: Next,
-) -> Response {
+pub async fn require_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let auth_header = request
         .headers()
         .get("authorization")

@@ -24,11 +24,12 @@ WORKDIR /home/fishnet
 
 COPY --from=backend-build /app/target/release/fishnet /usr/local/bin/fishnet
 
-RUN mkdir -p /home/fishnet/.fishnet && chown -R fishnet:fishnet /home/fishnet
+RUN mkdir -p /var/lib/fishnet /home/fishnet && chown -R fishnet:fishnet /var/lib/fishnet /home/fishnet
 
 USER fishnet
 
 ENV FISHNET_HOST=0.0.0.0
+ENV FISHNET_DATA_DIR=/var/lib/fishnet
 EXPOSE 8473
 
 CMD ["fishnet"]

@@ -45,7 +45,6 @@ impl SessionStore {
 
         sessions.retain(|_, s| s.expires_at > now);
 
-
         if sessions.len() >= self.max_sessions
             && let Some(oldest_key) = sessions
                 .iter()

@@ -19,6 +19,8 @@ pub enum ConfigError {
         path: PathBuf,
         source: toml::de::Error,
     },
+    #[error("invalid config in {path}: {message}")]
+    Validation { path: PathBuf, message: String },
     #[error("failed to serialize config to {path}: {source}")]
     Serialize {
         path: PathBuf,
@@ -27,7 +29,7 @@ pub enum ConfigError {
 }
 
 pub fn default_config_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(constants::FISHNET_DIR).join(constants::CONFIG_FILE))
+    constants::default_data_file(constants::CONFIG_FILE)
 }
 
 pub fn resolve_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
@@ -35,16 +37,25 @@ pub fn resolve_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
         return Some(path.to_path_buf());
     }
 
-    let cwd_config = PathBuf::from(constants::CONFIG_FILE);
-    if cwd_config.exists() {
-        return Some(cwd_config);
+    if let Ok(raw) = std::env::var(constants::ENV_FISHNET_CONFIG) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
     }
 
-    if let Some(mut home_config) = dirs::home_dir() {
-        home_config.push(constants::FISHNET_DIR);
-        home_config.push(constants::CONFIG_FILE);
-        if home_config.exists() {
-            return Some(home_config);
+    if let Some(default_config) = default_config_path()
+        && default_config.exists()
+    {
+        return Some(default_config);
+    }
+
+    // Backward compatibility for existing local installs using ~/.fishnet/fishnet.toml.
+    if let Some(mut legacy_home_config) = dirs::home_dir() {
+        legacy_home_config.push(constants::FISHNET_DIR);
+        legacy_home_config.push(constants::CONFIG_FILE);
+        if legacy_home_config.exists() {
+            return Some(legacy_home_config);
         }
     }
 
@@ -58,12 +69,29 @@ pub fn load_config(path: Option<&Path>) -> Result<FishnetConfig, ConfigError> {
                 path: path.to_path_buf(),
                 source: e,
             })?;
-            toml::from_str(&content).map_err(|e| ConfigError::Parse {
-                path: path.to_path_buf(),
-                source: e,
-            })
+            let mut config: FishnetConfig =
+                toml::from_str(&content).map_err(|e| ConfigError::Parse {
+                    path: path.to_path_buf(),
+                    source: e,
+                })?;
+            config
+                .validate()
+                .map_err(|message| ConfigError::Validation {
+                    path: path.to_path_buf(),
+                    message,
+                })?;
+            Ok(config)
         }
-        None => Ok(FishnetConfig::default()),
+        None => {
+            let mut config = FishnetConfig::default();
+            config
+                .validate()
+                .map_err(|message| ConfigError::Validation {
+                    path: PathBuf::from("<defaults>"),
+                    message,
+                })?;
+            Ok(config)
+        }
     }
 }
 
@@ -77,11 +105,10 @@ pub fn config_channel(
 }
 
 pub fn save_config(path: &Path, config: &FishnetConfig) -> Result<(), ConfigError> {
-    let toml_string =
-        toml::to_string_pretty(config).map_err(|e| ConfigError::Serialize {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
+    let toml_string = toml::to_string_pretty(config).map_err(|e| ConfigError::Serialize {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| ConfigError::Read {
@@ -191,6 +218,59 @@ mode = "invalid_mode"
     }
 
     #[test]
+    fn load_rejects_recv_window_ms_above_binance_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fishnet.toml");
+        std::fs::write(
+            &path,
+            r#"
+[binance]
+recv_window_ms = 70000
+"#,
+        )
+        .unwrap();
+
+        let err = load_config(Some(&path)).unwrap_err();
+        assert!(matches!(err, ConfigError::Validation { .. }));
+        assert!(err.to_string().contains("recv_window_ms"));
+    }
+
+    #[test]
+    fn load_clamps_recv_window_ms_zero_to_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fishnet.toml");
+        std::fs::write(
+            &path,
+            r#"
+[binance]
+recv_window_ms = 0
+"#,
+        )
+        .unwrap();
+
+        let config = load_config(Some(&path)).unwrap();
+        assert_eq!(config.binance.recv_window_ms, 5_000);
+    }
+
+    #[test]
+    fn load_rejects_custom_service_with_empty_base_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fishnet.toml");
+        std::fs::write(
+            &path,
+            r#"
+[custom.github]
+auth_header = "Authorization"
+"#,
+        )
+        .unwrap();
+
+        let err = load_config(Some(&path)).unwrap_err();
+        assert!(matches!(err, ConfigError::Validation { .. }));
+        assert!(err.to_string().contains("custom.github.base_url"));
+    }
+
+    #[test]
     fn save_config_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fishnet.toml");
@@ -199,6 +279,14 @@ mode = "invalid_mode"
         config.llm.track_spend = true;
         config.llm.daily_budget_usd = 42.5;
         config.llm.rate_limit_per_minute = 100;
+        config.http.connect_timeout_ms = 7_500;
+        config.http.request_timeout_ms = 45_000;
+        config.http.pool_idle_timeout_secs = 120;
+        config.http.pool_max_idle_per_host = 32;
+        config
+            .http
+            .upstream_pool_max_idle_per_host
+            .insert("openai".to_string(), 64);
         config.alerts.prompt_drift = false;
         config.alerts.retention_days = 7;
         config.dashboard.spend_history_days = 14;
@@ -209,6 +297,14 @@ mode = "invalid_mode"
         assert!(loaded.llm.track_spend);
         assert!((loaded.llm.daily_budget_usd - 42.5).abs() < f64::EPSILON);
         assert_eq!(loaded.llm.rate_limit_per_minute, 100);
+        assert_eq!(loaded.http.connect_timeout_ms, 7_500);
+        assert_eq!(loaded.http.request_timeout_ms, 45_000);
+        assert_eq!(loaded.http.pool_idle_timeout_secs, 120);
+        assert_eq!(loaded.http.pool_max_idle_per_host, 32);
+        assert_eq!(
+            loaded.http.upstream_pool_max_idle_per_host.get("openai"),
+            Some(&64usize)
+        );
         assert!(!loaded.alerts.prompt_drift);
         assert_eq!(loaded.alerts.retention_days, 7);
         assert_eq!(loaded.dashboard.spend_history_days, 14);
@@ -253,6 +349,7 @@ spend_history_days = 60
 [alerts]
 prompt_drift = false
 budget_warning = false
+new_endpoint = false
 retention_days = 7
 "#,
         )
@@ -263,6 +360,7 @@ retention_days = 7
         assert!(config.alerts.prompt_size);
         assert!(!config.alerts.budget_warning);
         assert!(config.alerts.budget_exceeded);
+        assert!(!config.alerts.new_endpoint);
         assert_eq!(config.alerts.retention_days, 7);
     }
 
@@ -290,6 +388,44 @@ rate_limit_per_minute = 50
     }
 
     #[test]
+    fn load_http_client_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fishnet.toml");
+        std::fs::write(
+            &path,
+            r#"
+[http]
+connect_timeout_ms = 8000
+request_timeout_ms = 120000
+pool_idle_timeout_secs = 45
+pool_max_idle_per_host = 24
+
+[http.upstream_pool_max_idle_per_host]
+openai = 48
+"custom.github" = 6
+"#,
+        )
+        .unwrap();
+
+        let config = load_config(Some(&path)).unwrap();
+        assert_eq!(config.http.connect_timeout_ms, 8_000);
+        assert_eq!(config.http.request_timeout_ms, 120_000);
+        assert_eq!(config.http.pool_idle_timeout_secs, 45);
+        assert_eq!(config.http.pool_max_idle_per_host, 24);
+        assert_eq!(
+            config.http.upstream_pool_max_idle_per_host.get("openai"),
+            Some(&48usize)
+        );
+        assert_eq!(
+            config
+                .http
+                .upstream_pool_max_idle_per_host
+                .get("custom.github"),
+            Some(&6usize)
+        );
+    }
+
+    #[test]
     fn load_defaults_for_new_sections_when_absent() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fishnet.toml");
@@ -303,9 +439,18 @@ enabled = false
         .unwrap();
 
         let config = load_config(Some(&path)).unwrap();
+        assert_eq!(config.http.connect_timeout_ms, 5_000);
+        assert_eq!(config.http.request_timeout_ms, 0);
+        assert_eq!(config.http.pool_idle_timeout_secs, 90);
+        assert_eq!(config.http.pool_max_idle_per_host, 16);
+        assert!(config.http.upstream_pool_max_idle_per_host.is_empty());
         assert_eq!(config.dashboard.spend_history_days, 30);
         assert!(config.alerts.prompt_drift);
         assert!(config.alerts.prompt_size);
+        assert!(config.alerts.anomalous_volume);
+        assert!(config.alerts.new_endpoint);
+        assert!(config.alerts.time_anomaly);
+        assert!(config.alerts.high_severity_denied_action);
         assert_eq!(config.alerts.retention_days, 30);
         assert!(config.llm.track_spend);
         assert!((config.llm.daily_budget_usd - 20.0).abs() < f64::EPSILON);

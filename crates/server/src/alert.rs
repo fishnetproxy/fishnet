@@ -2,11 +2,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
 use crate::constants;
@@ -18,6 +18,8 @@ pub enum AlertError {
     Db(#[from] rusqlite::Error),
     #[error("task join error: {0}")]
     Join(#[from] tokio::task::JoinError),
+    #[error("state poisoned: {0}")]
+    Poisoned(String),
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -29,6 +31,10 @@ pub enum AlertType {
     BudgetExceeded,
     OnchainDenied,
     RateLimitHit,
+    AnomalousVolume,
+    NewEndpoint,
+    TimeAnomaly,
+    HighSeverityDeniedAction,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -58,6 +64,10 @@ fn alert_type_to_str(t: AlertType) -> &'static str {
         AlertType::BudgetExceeded => "budget_exceeded",
         AlertType::OnchainDenied => "onchain_denied",
         AlertType::RateLimitHit => "rate_limit_hit",
+        AlertType::AnomalousVolume => "anomalous_volume",
+        AlertType::NewEndpoint => "new_endpoint",
+        AlertType::TimeAnomaly => "time_anomaly",
+        AlertType::HighSeverityDeniedAction => "high_severity_denied_action",
     }
 }
 
@@ -69,6 +79,10 @@ fn str_to_alert_type(s: &str) -> AlertType {
         "budget_exceeded" => AlertType::BudgetExceeded,
         "onchain_denied" => AlertType::OnchainDenied,
         "rate_limit_hit" => AlertType::RateLimitHit,
+        "anomalous_volume" => AlertType::AnomalousVolume,
+        "new_endpoint" => AlertType::NewEndpoint,
+        "time_anomaly" => AlertType::TimeAnomaly,
+        "high_severity_denied_action" => AlertType::HighSeverityDeniedAction,
         _ => AlertType::PromptDrift,
     }
 }
@@ -93,6 +107,12 @@ const CLEANUP_INTERVAL_SECS: i64 = 7 * 24 * 60 * 60;
 pub struct AlertStore {
     conn: Arc<Mutex<Connection>>,
     last_cleanup_at: AtomicI64,
+}
+
+fn poison_to_sqlite_error(resource: &str) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(format!(
+        "{resource} mutex is poisoned"
+    ))))
 }
 
 impl AlertStore {
@@ -122,7 +142,10 @@ impl AlertStore {
     }
 
     fn migrate(&self) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| poison_to_sqlite_error("alerts database connection"))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS alerts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -156,7 +179,9 @@ impl AlertStore {
         let svc = service.clone();
         let msg = message.clone();
         let rowid = tokio::task::spawn_blocking(move || -> Result<i64, AlertError> {
-            let conn = conn.lock().unwrap();
+            let conn = conn
+                .lock()
+                .map_err(|_| AlertError::Poisoned("alerts database connection".to_string()))?;
             conn.execute(
                 "INSERT INTO alerts (alert_type, severity, service, message, timestamp, dismissed)
                  VALUES (?1, ?2, ?3, ?4, ?5, 0)",
@@ -167,7 +192,7 @@ impl AlertStore {
         .await??;
 
         Ok(Alert {
-            id: format!("alert_{:03}", rowid),
+            id: format!("alert_{rowid}"),
             alert_type,
             severity,
             service,
@@ -180,7 +205,9 @@ impl AlertStore {
     pub async fn list(&self) -> Result<Vec<Alert>, AlertError> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<Alert>, AlertError> {
-            let conn = conn.lock().unwrap();
+            let conn = conn
+                .lock()
+                .map_err(|_| AlertError::Poisoned("alerts database connection".to_string()))?;
             let mut stmt = conn.prepare(
                 "SELECT id, alert_type, severity, service, message, timestamp, dismissed
                  FROM alerts ORDER BY id ASC",
@@ -191,7 +218,7 @@ impl AlertStore {
                 let severity_str: String = row.get(2)?;
                 let dismissed_int: i64 = row.get(6)?;
                 Ok(Alert {
-                    id: format!("alert_{:03}", rowid),
+                    id: format!("alert_{rowid}"),
                     alert_type: str_to_alert_type(&type_str),
                     severity: str_to_severity(&severity_str),
                     service: row.get(3)?,
@@ -215,15 +242,14 @@ impl AlertStore {
             .unwrap_or(true)
     }
 
-    async fn should_create_onchain_alert_inner(
-        &self,
-        message: &str,
-    ) -> Result<bool, AlertError> {
+    async fn should_create_onchain_alert_inner(&self, message: &str) -> Result<bool, AlertError> {
         let conn = self.conn.clone();
         let message = message.to_string();
         let one_hour_ago = chrono::Utc::now().timestamp() - 3600;
         tokio::task::spawn_blocking(move || -> Result<bool, AlertError> {
-            let conn = conn.lock().unwrap();
+            let conn = conn
+                .lock()
+                .map_err(|_| AlertError::Poisoned("alerts database connection".to_string()))?;
             let count: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM alerts
                  WHERE alert_type = 'onchain_denied' AND message = ?1 AND timestamp > ?2",
@@ -245,7 +271,9 @@ impl AlertStore {
         }
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<bool, AlertError> {
-            let conn = conn.lock().unwrap();
+            let conn = conn
+                .lock()
+                .map_err(|_| AlertError::Poisoned("alerts database connection".to_string()))?;
             let updated = conn.execute(
                 "UPDATE alerts SET dismissed = 1 WHERE id = ?1",
                 params![numeric_id],
@@ -260,11 +288,10 @@ impl AlertStore {
         let now = chrono::Utc::now().timestamp();
         let cutoff = now - (retention_days as i64 * 24 * 60 * 60);
         tokio::task::spawn_blocking(move || -> Result<(), AlertError> {
-            let conn = conn.lock().unwrap();
-            conn.execute(
-                "DELETE FROM alerts WHERE timestamp < ?1",
-                params![cutoff],
-            )?;
+            let conn = conn
+                .lock()
+                .map_err(|_| AlertError::Poisoned("alerts database connection".to_string()))?;
+            conn.execute("DELETE FROM alerts WHERE timestamp < ?1", params![cutoff])?;
             Ok(())
         })
         .await??;
@@ -282,10 +309,7 @@ impl AlertStore {
     }
 
     pub fn default_path() -> Option<PathBuf> {
-        let mut path = dirs::home_dir()?;
-        path.push(constants::FISHNET_DIR);
-        path.push(constants::ALERTS_DB_FILE);
-        Some(path)
+        constants::default_data_file(constants::ALERTS_DB_FILE)
     }
 }
 
@@ -379,6 +403,10 @@ pub async fn get_alert_config(State(state): State<AppState>) -> impl IntoRespons
             "budget_exceeded": config.alerts.budget_exceeded,
             "onchain_denied": config.alerts.onchain_denied,
             "rate_limit_hit": config.alerts.rate_limit_hit,
+            "anomalous_volume": config.alerts.anomalous_volume,
+            "new_endpoint": config.alerts.new_endpoint,
+            "time_anomaly": config.alerts.time_anomaly,
+            "high_severity_denied_action": config.alerts.high_severity_denied_action,
         },
         "retention_days": config.alerts.retention_days,
     }))
@@ -392,6 +420,10 @@ pub struct UpdateAlertConfigRequest {
     pub budget_exceeded: Option<bool>,
     pub onchain_denied: Option<bool>,
     pub rate_limit_hit: Option<bool>,
+    pub anomalous_volume: Option<bool>,
+    pub new_endpoint: Option<bool>,
+    pub time_anomaly: Option<bool>,
+    pub high_severity_denied_action: Option<bool>,
     pub retention_days: Option<u32>,
 }
 
@@ -420,6 +452,18 @@ pub async fn update_alert_config(
     if let Some(v) = req.rate_limit_hit {
         updated.alerts.rate_limit_hit = v;
     }
+    if let Some(v) = req.anomalous_volume {
+        updated.alerts.anomalous_volume = v;
+    }
+    if let Some(v) = req.new_endpoint {
+        updated.alerts.new_endpoint = v;
+    }
+    if let Some(v) = req.time_anomaly {
+        updated.alerts.time_anomaly = v;
+    }
+    if let Some(v) = req.high_severity_denied_action {
+        updated.alerts.high_severity_denied_action = v;
+    }
     if let Some(v) = req.retention_days {
         updated.alerts.retention_days = v;
     }
@@ -434,6 +478,10 @@ pub async fn update_alert_config(
                 "budget_exceeded": updated.alerts.budget_exceeded,
                 "onchain_denied": updated.alerts.onchain_denied,
                 "rate_limit_hit": updated.alerts.rate_limit_hit,
+                "anomalous_volume": updated.alerts.anomalous_volume,
+                "new_endpoint": updated.alerts.new_endpoint,
+                "time_anomaly": updated.alerts.time_anomaly,
+                "high_severity_denied_action": updated.alerts.high_severity_denied_action,
             },
             "retention_days": updated.alerts.retention_days,
         }))

@@ -17,3 +17,14 @@ fishnet-types = { path = "../types" }
 tokio.workspace = true
 axum.workspace = true
 reqwest.workspace = true
+hex.workspace = true
+zeroize.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap = { version = "4.5", features = ["derive"] }
+libc.workspace = true
+dirs.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"

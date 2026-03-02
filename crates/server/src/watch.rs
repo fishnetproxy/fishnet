@@ -8,6 +8,14 @@ use tokio::sync::{mpsc, watch};
 
 use crate::config::load_config;
 
+fn watch_dir_for_config_path(config_path: &std::path::Path) -> PathBuf {
+    match config_path.parent() {
+        Some(parent) if parent.as_os_str().is_empty() => PathBuf::from("."),
+        Some(parent) => parent.to_path_buf(),
+        None => PathBuf::from("."),
+    }
+}
+
 pub fn spawn_config_watcher(
     config_path: PathBuf,
     config_tx: watch::Sender<Arc<FishnetConfig>>,
@@ -35,10 +43,7 @@ pub fn spawn_config_watcher(
     })
     .expect("failed to create file watcher");
 
-    let watch_dir = config_path
-        .parent()
-        .expect("config path must have a parent directory")
-        .to_path_buf();
+    let watch_dir = watch_dir_for_config_path(&config_path);
 
     watcher
         .watch(&watch_dir, RecursiveMode::NonRecursive)
@@ -55,16 +60,11 @@ pub fn spawn_config_watcher(
 
             match load_config(Some(&config_path)) {
                 Ok(new_config) => {
-                    eprintln!(
-                        "[fishnet] config reloaded from {}",
-                        config_path.display()
-                    );
+                    eprintln!("[fishnet] config reloaded from {}", config_path.display());
                     let _ = config_tx.send(Arc::new(new_config));
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[fishnet] config reload failed, keeping previous config: {e}"
-                    );
+                    eprintln!("[fishnet] config reload failed, keeping previous config: {e}");
                 }
             }
         }
@@ -77,6 +77,12 @@ pub fn spawn_config_watcher(
 mod tests {
     use super::*;
     use crate::config::config_channel;
+
+    #[test]
+    fn watch_dir_for_relative_config_uses_current_dir() {
+        let dir = watch_dir_for_config_path(std::path::Path::new("fishnet.toml"));
+        assert_eq!(dir, PathBuf::from("."));
+    }
 
     #[tokio::test]
     async fn watcher_detects_config_change() {

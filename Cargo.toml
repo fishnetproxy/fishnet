@@ -34,3 +34,12 @@ k256 = { version = "0.13", features = ["ecdsa"] }
 alloy-primitives = "0.8"
 hex = "0.4"
 async-trait = "0.1"
+argon2 = "0.5"
+libsodium-sys = "0.2.7"
+uuid = { version = "1", features = ["v4"] }
+zeroize = "1"
+libc = "0.2"
+hmac = "0.12"
+url = "2"
+rust_decimal = "1"
+tiny-keccak = { version = "2", features = ["keccak"] }

@@ -59,6 +59,16 @@ make build-prod   # builds frontend, then compiles with --features embed-dashboa
 ./target/release/fishnet
 ```
 
+#### Release install script (Linux/macOS)
+
+```sh
+curl -fsSL https://github.com/iamyxsh/fishnet/releases/latest/download/install.sh | sh
+```
+
+Install path defaults to `~/.local/bin` (override with `INSTALL_DIR=/your/path`).
+Runtime data defaults to `/var/lib/fishnet` (Linux) or `/Library/Application Support/Fishnet` (macOS).
+For local dev/CI, override with `FISHNET_DATA_DIR=/your/path`.
+
 #### Docker
 
 ```sh
@@ -67,6 +77,20 @@ make docker-logs  # tail logs
 make docker-down  # stop
 make docker-clean # remove container, volume, and image
 ```
+
+For tagged releases, multi-arch Docker images are published to:
+
+```sh
+docker pull d3vdhruv/fishnet:<version>
+docker pull d3vdhruv/fishnet:latest
+```
+
+#### Homebrew (release automation)
+
+Homebrew formula generation is automated on release publish. Optional tap publishing can be enabled via repo settings:
+
+- Repo variable: `HOMEBREW_TAP_REPOSITORY` (for example `d3vdhruv/homebrew-tap`)
+- Repo secret: `HOMEBREW_TAP_TOKEN`
 
 ### Quality
 
