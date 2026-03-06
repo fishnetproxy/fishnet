@@ -290,6 +290,7 @@ pub struct OnchainConfig {
     pub chain_ids: Vec<u64>,
     pub limits: OnchainLimits,
     pub permits: OnchainPermits,
+    pub approval: OnchainApprovalConfig,
     pub whitelist: HashMap<String, Vec<String>>,
 }
 
@@ -329,6 +330,22 @@ impl Default for OnchainPermits {
             expiry_seconds: 300,
             require_policy_hash: true,
             verifying_contract: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OnchainApprovalConfig {
+    pub enabled: bool,
+    pub ttl_seconds: u64,
+}
+
+impl Default for OnchainApprovalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ttl_seconds: 60,
         }
     }
 }

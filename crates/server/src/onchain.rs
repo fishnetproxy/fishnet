@@ -329,7 +329,8 @@ pub async fn submit_handler(
         .into_response();
     }
 
-    let signer_info = state.signer.status();
+    let signer = state.current_signer().await;
+    let signer_info = signer.status();
     let wallet_hex = signer_info
         .address
         .strip_prefix("0x")
@@ -428,8 +429,8 @@ pub async fn submit_handler(
         verifying_contract: config.onchain.permits.verifying_contract.clone(),
     };
 
-    let signature = match state.signer.sign_permit(&permit).await {
-        Ok(sig) => format!("0x{}", hex::encode(&sig)),
+    let signed_permit = match signer.sign_permit_with_proof(&permit).await {
+        Ok(signed) => signed,
         Err(e) => {
             eprintln!("[fishnet] signing failed: {e}");
             log_onchain_audit_decision(
@@ -451,6 +452,31 @@ pub async fn submit_handler(
                 .into_response();
         }
     };
+
+    if config.onchain.approval.enabled && signed_permit.approval.is_none() {
+        let reason = "approval is enabled but signer did not return approval proof".to_string();
+        eprintln!("[fishnet] signing failed: {reason}");
+        log_onchain_audit_decision(
+            &state,
+            &audit_ctx,
+            "denied",
+            Some(reason.clone()),
+            None,
+            None,
+        )
+        .await;
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "error",
+                "error": "approval_unavailable",
+                "reason": reason
+            })),
+        )
+            .into_response();
+    }
+
+    let signature = format!("0x{}", hex::encode(&signed_permit.signature));
 
     let permit_hash_str = format!("0x{}", hex::encode(Keccak256::digest(signature.as_bytes())));
     let tx_value: f64 = req.value.parse().unwrap_or(0.0);
@@ -500,6 +526,7 @@ pub async fn submit_handler(
             "verifyingContract": permit.verifying_contract,
         },
         "signature": signature,
+        "approval": signed_permit.approval,
     }))
     .into_response()
 }
@@ -589,6 +616,10 @@ pub async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
             "require_policy_hash": config.onchain.permits.require_policy_hash,
             "verifying_contract": config.onchain.permits.verifying_contract,
         },
+        "approval": {
+            "enabled": config.onchain.approval.enabled,
+            "ttl_seconds": config.onchain.approval.ttl_seconds,
+        },
         "whitelist": config.onchain.whitelist,
     }))
 }
@@ -605,6 +636,8 @@ pub struct UpdateOnchainConfigRequest {
     pub expiry_seconds: Option<u64>,
     pub require_policy_hash: Option<bool>,
     pub verifying_contract: Option<String>,
+    pub approval_enabled: Option<bool>,
+    pub approval_ttl_seconds: Option<u64>,
     pub whitelist: Option<std::collections::HashMap<String, Vec<String>>>,
 }
 
@@ -631,6 +664,9 @@ pub async fn update_config(
     }
     if matches!(req.expiry_seconds, Some(v) if !(60..=3600).contains(&v)) {
         errors.push("expiry_seconds must be between 60 and 3600");
+    }
+    if matches!(req.approval_ttl_seconds, Some(v) if !(10..=900).contains(&v)) {
+        errors.push("approval_ttl_seconds must be between 10 and 900");
     }
     if let Some(ref v) = req.verifying_contract {
         let hex = v.strip_prefix("0x").unwrap_or(v);
@@ -682,6 +718,12 @@ pub async fn update_config(
     if let Some(v) = req.verifying_contract {
         updated.onchain.permits.verifying_contract = v;
     }
+    if let Some(v) = req.approval_enabled {
+        updated.onchain.approval.enabled = v;
+    }
+    if let Some(v) = req.approval_ttl_seconds {
+        updated.onchain.approval.ttl_seconds = v;
+    }
     if let Some(v) = req.whitelist {
         updated.onchain.whitelist = v;
     }
@@ -702,6 +744,10 @@ pub async fn update_config(
                 "expiry_seconds": updated.onchain.permits.expiry_seconds,
                 "require_policy_hash": updated.onchain.permits.require_policy_hash,
                 "verifying_contract": updated.onchain.permits.verifying_contract,
+            },
+            "approval": {
+                "enabled": updated.onchain.approval.enabled,
+                "ttl_seconds": updated.onchain.approval.ttl_seconds,
             },
             "whitelist": updated.onchain.whitelist,
         }))
