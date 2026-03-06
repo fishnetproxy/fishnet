@@ -5,8 +5,12 @@ use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
 use fishnet_server::config::load_config;
+#[cfg(all(target_os = "macos", not(feature = "dev-seed")))]
+use fishnet_server::signer::BridgeApprovalSigner;
 #[cfg(not(feature = "dev-seed"))]
-use fishnet_server::signer::StubSigner;
+use fishnet_server::signer::{
+    BridgeSigner, StubSigner, random_secp256k1_secret, secp256k1_secret_is_valid,
+};
 use fishnet_server::{
     alert::{AlertSeverity, AlertStore},
     anomaly::AnomalyTracker,
@@ -24,8 +28,22 @@ use fishnet_server::{
     vault::{CredentialMetadata, CredentialStore},
     watch::spawn_config_watcher,
 };
+#[cfg(all(target_os = "macos", not(feature = "dev-seed")))]
+use p256::ecdsa::Signature as P256Signature;
+#[cfg(target_os = "macos")]
+use security_framework::access_control::{ProtectionMode, SecAccessControl};
+#[cfg(all(target_os = "macos", not(feature = "dev-seed")))]
+use security_framework::item::{
+    ItemClass, ItemSearchOptions, KeyClass, Location, Reference, SearchResult,
+};
+#[cfg(all(target_os = "macos", not(feature = "dev-seed")))]
+use security_framework::key::{Algorithm, GenerateKeyOptions, KeyType, SecKey, Token};
 #[cfg(target_os = "macos")]
 use security_framework::passwords::{get_generic_password, set_generic_password};
+#[cfg(all(target_os = "macos", not(feature = "dev-seed")))]
+use security_framework_sys::access_control::{
+    kSecAccessControlPrivateKeyUsage, kSecAccessControlUserPresence,
+};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -1087,7 +1105,7 @@ async fn run_server(explicit_config: Option<PathBuf>) -> Result<(), String> {
 
     let load_baselines = !config.llm.prompt_drift.reset_baseline_on_restart;
 
-    let (config_tx, config_rx) = config_channel(config);
+    let (config_tx, config_rx) = config_channel(config.clone());
 
     let config_path_for_state = config_path
         .clone()
@@ -1127,12 +1145,9 @@ async fn run_server(explicit_config: Option<PathBuf>) -> Result<(), String> {
     };
     #[cfg(not(feature = "dev-seed"))]
     let signer: Arc<dyn SignerTrait> = {
-        let s = StubSigner::new();
-        eprintln!(
-            "[fishnet] signer initialized (mode: stub-secp256k1, address: {})",
-            s.status().address
-        );
-        Arc::new(s)
+        let signer = build_runtime_signer_for_config(&config)?;
+        log_signer_summary("[fishnet] signer initialized", signer.as_ref());
+        signer
     };
 
     let state = AppState::new(
@@ -1162,6 +1177,8 @@ async fn run_server(explicit_config: Option<PathBuf>) -> Result<(), String> {
     );
 
     spawn_baseline_config_watcher(state.config_rx.clone(), baseline_store);
+    #[cfg(not(feature = "dev-seed"))]
+    spawn_signer_config_watcher(state.clone());
 
     {
         let retention_days = state.config().alerts.retention_days;
@@ -1850,6 +1867,86 @@ fn spawn_baseline_config_watcher(
     });
 }
 
+#[cfg(not(feature = "dev-seed"))]
+fn log_signer_summary(prefix: &str, signer: &dyn SignerTrait) {
+    let status = signer.status();
+    eprintln!(
+        "{prefix} (mode: {}, address: {}, approval_mode: {}, approval_ttl_seconds: {})",
+        status.mode,
+        status.address,
+        status.approval_mode.as_deref().unwrap_or("none"),
+        status.approval_ttl_seconds.unwrap_or(0)
+    );
+}
+
+#[cfg(not(feature = "dev-seed"))]
+fn build_runtime_signer_for_config(
+    config: &fishnet_types::config::FishnetConfig,
+) -> Result<Arc<dyn SignerTrait>, String> {
+    let base_signer = load_or_create_runtime_signer()?;
+    let base_signer: Arc<dyn SignerTrait> = Arc::new(base_signer);
+    if !config.onchain.approval.enabled {
+        return Ok(base_signer);
+    }
+
+    let bridge_signer = create_bridge_signer(base_signer, config.onchain.approval.ttl_seconds)?;
+    Ok(Arc::new(bridge_signer))
+}
+
+#[cfg(all(target_os = "macos", not(feature = "dev-seed")))]
+fn create_bridge_signer(
+    base_signer: Arc<dyn SignerTrait>,
+    approval_ttl_seconds: u64,
+) -> Result<BridgeSigner, String> {
+    let approval_signer = load_or_create_bridge_approval_signer()?;
+    BridgeSigner::with_approval_signer(base_signer, approval_signer, approval_ttl_seconds)
+        .map_err(|e| format!("failed to initialize bridge signer: {e}"))
+}
+
+#[cfg(all(not(target_os = "macos"), not(feature = "dev-seed")))]
+fn create_bridge_signer(
+    _base_signer: Arc<dyn SignerTrait>,
+    _approval_ttl_seconds: u64,
+) -> Result<BridgeSigner, String> {
+    Err("onchain.approval requires macOS Secure Enclave support on this build".to_string())
+}
+
+#[cfg(not(feature = "dev-seed"))]
+fn spawn_signer_config_watcher(state: AppState) {
+    let mut config_rx = state.config_rx.clone();
+    let initial = config_rx.borrow().clone();
+    let mut prev_approval_enabled = initial.onchain.approval.enabled;
+    let mut prev_approval_ttl = initial.onchain.approval.ttl_seconds;
+
+    tokio::spawn(async move {
+        while config_rx.changed().await.is_ok() {
+            let cfg = config_rx.borrow().clone();
+            let approval_enabled = cfg.onchain.approval.enabled;
+            let approval_ttl = cfg.onchain.approval.ttl_seconds;
+            if approval_enabled == prev_approval_enabled && approval_ttl == prev_approval_ttl {
+                continue;
+            }
+
+            match build_runtime_signer_for_config(cfg.as_ref()) {
+                Ok(new_signer) => {
+                    log_signer_summary(
+                        "[fishnet] signer reloaded after onchain.approval config update",
+                        new_signer.as_ref(),
+                    );
+                    state.replace_signer(new_signer).await;
+                    prev_approval_enabled = approval_enabled;
+                    prev_approval_ttl = approval_ttl;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[fishnet] warning: failed to reload signer after onchain.approval config update: {e}"
+                    );
+                }
+            }
+        }
+    });
+}
+
 fn open_credential_store(
     path: std::path::PathBuf,
     explicit_password: Option<&str>,
@@ -1905,6 +2002,252 @@ fn open_credential_store(
         "{} is not set and no usable keychain vault key was found",
         fishnet_server::constants::ENV_FISHNET_MASTER_PASSWORD
     ))
+}
+
+#[cfg(not(feature = "dev-seed"))]
+fn load_or_create_runtime_signer() -> Result<StubSigner, String> {
+    let path = signer_key_path()?;
+
+    if let Some(secret) = load_hex_key32_from_file(
+        &path,
+        "runtime secp256k1 signer key",
+        secp256k1_secret_is_valid,
+    )? {
+        return StubSigner::try_from_bytes(secret)
+            .map_err(|e| format!("failed to initialize runtime signer from key file: {e}"));
+    }
+
+    let secret = random_secp256k1_secret();
+    write_hex_key32_to_file(&path, &secret)?;
+    StubSigner::try_from_bytes(secret)
+        .map_err(|e| format!("failed to initialize runtime signer: {e}"))
+}
+
+#[cfg(all(target_os = "macos", not(feature = "dev-seed")))]
+struct SecureEnclaveBridgeApprovalSigner {
+    private_key: SecKey,
+    public_key_hex: String,
+    mode: String,
+}
+
+#[cfg(all(target_os = "macos", not(feature = "dev-seed")))]
+impl SecureEnclaveBridgeApprovalSigner {
+    fn from_private_key(private_key: SecKey, mode: String) -> Result<Self, String> {
+        let public_key = private_key
+            .public_key()
+            .ok_or_else(|| "failed to derive public key from Secure Enclave key".to_string())?;
+        let public_bytes = public_key
+            .external_representation()
+            .ok_or_else(|| "failed to export Secure Enclave public key".to_string())?
+            .to_vec();
+        if public_bytes.len() != 65 || public_bytes.first().copied() != Some(0x04) {
+            return Err(format!(
+                "unexpected Secure Enclave public key format (expected 65-byte uncompressed sec1, got {} bytes)",
+                public_bytes.len()
+            ));
+        }
+        Ok(Self {
+            private_key,
+            public_key_hex: format!("0x{}", hex::encode(public_bytes)),
+            mode,
+        })
+    }
+}
+
+#[cfg(all(target_os = "macos", not(feature = "dev-seed")))]
+impl BridgeApprovalSigner for SecureEnclaveBridgeApprovalSigner {
+    fn mode(&self) -> &str {
+        &self.mode
+    }
+
+    fn public_key_hex(&self) -> &str {
+        &self.public_key_hex
+    }
+
+    fn sign_prehash(
+        &self,
+        prehash: &[u8; 32],
+    ) -> Result<P256Signature, fishnet_server::signer::SignerError> {
+        let der = self
+            .private_key
+            .create_signature(Algorithm::ECDSASignatureDigestX962, prehash)
+            .map_err(|e| {
+                fishnet_server::signer::SignerError::ApprovalFailed(format!(
+                    "Secure Enclave signing failed: {e}"
+                ))
+            })?;
+        P256Signature::from_der(&der).map_err(|e| {
+            fishnet_server::signer::SignerError::ApprovalFailed(format!(
+                "invalid DER signature from Secure Enclave: {e}"
+            ))
+        })
+    }
+}
+
+#[cfg(all(target_os = "macos", not(feature = "dev-seed")))]
+fn bridge_approval_secure_enclave_label() -> String {
+    let (service, account) = bridge_approval_keychain_service_account();
+    format!("fishnet.bridge.approval.se.v1:{service}:{account}")
+}
+
+#[cfg(all(target_os = "macos", not(feature = "dev-seed")))]
+fn find_bridge_approval_secure_enclave_key(label: &str) -> Result<Option<SecKey>, String> {
+    let mut search = ItemSearchOptions::new();
+    search
+        .class(ItemClass::key())
+        .key_class(KeyClass::private())
+        .label(label)
+        .load_refs(true)
+        .limit(1);
+
+    let results = match search.search() {
+        Ok(results) => results,
+        Err(e) => {
+            // errSecItemNotFound
+            if e.code() == -25300 {
+                return Ok(None);
+            }
+            return Err(format!(
+                "failed to query Secure Enclave bridge key from keychain: {e}"
+            ));
+        }
+    };
+
+    for result in results {
+        if let SearchResult::Ref(Reference::Key(key)) = result {
+            return Ok(Some(key));
+        }
+    }
+
+    Ok(None)
+}
+
+#[cfg(all(target_os = "macos", not(feature = "dev-seed")))]
+fn create_bridge_approval_secure_enclave_key(label: &str) -> Result<SecKey, String> {
+    let access_flags = kSecAccessControlPrivateKeyUsage | kSecAccessControlUserPresence;
+    let build_access_control = || {
+        SecAccessControl::create_with_protection(
+            Some(ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly),
+            access_flags,
+        )
+        .map_err(|e| format!("failed to configure Secure Enclave access control: {e}"))
+    };
+
+    // Try persistent key first (stored in login keychain).
+    let mut options = GenerateKeyOptions::default();
+    options
+        .set_key_type(KeyType::ec_sec_prime_random())
+        .set_size_in_bits(256)
+        .set_label(label)
+        .set_token(Token::SecureEnclave)
+        .set_location(Location::DefaultFileKeychain)
+        .set_access_control(build_access_control()?);
+
+    match SecKey::new(&options) {
+        Ok(key) => Ok(key),
+        Err(primary_err) => {
+            // Fallback for unsigned/dev contexts where persistent Secure Enclave storage is denied.
+            let mut session_options = GenerateKeyOptions::default();
+            session_options
+                .set_key_type(KeyType::ec_sec_prime_random())
+                .set_size_in_bits(256)
+                .set_label(label)
+                .set_token(Token::SecureEnclave)
+                .set_access_control(build_access_control()?);
+            SecKey::new(&session_options).map_err(|fallback_err| {
+                format!(
+                    "failed to create Secure Enclave bridge approval key (persistent attempt failed: {primary_err}; session-only fallback failed: {fallback_err})"
+                )
+            })
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", not(feature = "dev-seed")))]
+fn secure_enclave_mode_for_key(label: &str) -> String {
+    match find_bridge_approval_secure_enclave_key(label) {
+        Ok(Some(_)) => "p256-secure-enclave-bridge".to_string(),
+        _ => "p256-secure-enclave-bridge-session".to_string(),
+    }
+}
+
+#[cfg(all(target_os = "macos", not(feature = "dev-seed")))]
+fn load_or_create_bridge_approval_signer() -> Result<Arc<dyn BridgeApprovalSigner>, String> {
+    let label = bridge_approval_secure_enclave_label();
+    let (private_key, mode) = match find_bridge_approval_secure_enclave_key(&label)? {
+        Some(existing) => (existing, "p256-secure-enclave-bridge".to_string()),
+        None => {
+            let key = create_bridge_approval_secure_enclave_key(&label)?;
+            // If key lookup still fails, we're using a session-only key.
+            let mode = secure_enclave_mode_for_key(&label);
+            (key, mode)
+        }
+    };
+
+    if mode == "p256-secure-enclave-bridge-session" {
+        eprintln!(
+            "[fishnet] warning: Secure Enclave key is session-only (not persisted in keychain; restart rotates approval key)"
+        );
+    }
+
+    let signer = SecureEnclaveBridgeApprovalSigner::from_private_key(private_key, mode)?;
+    Ok(Arc::new(signer))
+}
+
+#[cfg(not(feature = "dev-seed"))]
+fn signer_key_path() -> Result<PathBuf, String> {
+    fishnet_server::constants::default_data_file(fishnet_server::constants::SIGNER_KEY_FILE)
+        .ok_or_else(|| "could not determine signer key path".to_string())
+}
+
+#[cfg(not(feature = "dev-seed"))]
+fn load_hex_key32_from_file(
+    path: &Path,
+    label: &str,
+    validator: fn(&[u8; 32]) -> bool,
+) -> Result<Option<[u8; 32]>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read {label} file '{}': {e}", path.display()))?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{label} file '{}' is empty", path.display()));
+    }
+
+    let key = parse_hex_key32(trimmed, label, validator)?;
+    Ok(Some(key))
+}
+
+#[cfg(not(feature = "dev-seed"))]
+fn write_hex_key32_to_file(path: &Path, key: &[u8; 32]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create key directory '{}': {e}", parent.display()))?;
+    }
+    std::fs::write(path, format!("{}\n", hex::encode(key)))
+        .map_err(|e| format!("failed to write key file '{}': {e}", path.display()))?;
+    set_owner_only_file_permissions(path)?;
+    Ok(())
+}
+
+#[cfg(not(feature = "dev-seed"))]
+fn parse_hex_key32(
+    raw: &str,
+    label: &str,
+    validator: fn(&[u8; 32]) -> bool,
+) -> Result<[u8; 32], String> {
+    let stripped = raw.strip_prefix("0x").unwrap_or(raw);
+    let bytes = hex::decode(stripped).map_err(|e| format!("{label} is not valid hex: {e}"))?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| format!("{label} must be exactly 32 bytes"))?;
+    if !validator(&arr) {
+        return Err(format!("{label} is not valid for expected curve"));
+    }
+    Ok(arr)
 }
 
 #[cfg(target_os = "macos")]
@@ -1998,6 +2341,17 @@ fn store_keychain_value(value: &str) -> Result<(), String> {
     let (service, account) = keychain_service_account();
     set_generic_password(&service, &account, value.as_bytes())
         .map_err(|e| format!("failed to write macOS keychain item: {e}"))
+}
+
+#[cfg(all(target_os = "macos", not(feature = "dev-seed")))]
+fn bridge_approval_keychain_service_account() -> (String, String) {
+    let service =
+        std::env::var(fishnet_server::constants::ENV_FISHNET_BRIDGE_APPROVAL_KEYCHAIN_SERVICE)
+            .unwrap_or_else(|_| "fishnet".to_string());
+    let account =
+        std::env::var(fishnet_server::constants::ENV_FISHNET_BRIDGE_APPROVAL_KEYCHAIN_ACCOUNT)
+            .unwrap_or_else(|_| "bridge_approval_p256".to_string());
+    (service, account)
 }
 
 #[cfg(all(test, target_os = "macos"))]

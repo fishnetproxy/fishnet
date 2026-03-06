@@ -2342,6 +2342,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_onchain_approval_enabled_fails_closed_without_approval_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = onchain_config_enabled();
+        config.onchain.approval.enabled = true;
+        let (state, _tx) = test_state_with_config(dir.path(), config);
+        let app = create_router(state);
+        let token = setup_and_login(&app).await;
+
+        let resp = app
+            .clone()
+            .oneshot(onchain_submit_request(
+                "0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD",
+                &valid_calldata(),
+                "0",
+                8453,
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["status"], "error");
+        assert_eq!(body["error"], "approval_unavailable");
+    }
+
+    #[tokio::test]
     async fn test_onchain_unknown_contract_denied() {
         let dir = tempfile::tempdir().unwrap();
         let config = onchain_config_enabled();

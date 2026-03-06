@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use fishnet_types::config::FishnetConfig;
-use tokio::sync::watch;
+use tokio::sync::{RwLock, watch};
 
 use crate::alert::AlertStore;
 use crate::anomaly::AnomalyTracker;
@@ -36,7 +36,7 @@ pub struct AppState {
     pub http_clients_by_service: Arc<HashMap<String, reqwest::Client>>,
     pub anomaly_tracker: Arc<tokio::sync::Mutex<AnomalyTracker>>,
     pub onchain_store: Arc<OnchainStore>,
-    pub signer: Arc<dyn SignerTrait>,
+    signer: Arc<RwLock<Arc<dyn SignerTrait>>>,
     pub started_at: std::time::Instant,
 }
 
@@ -81,7 +81,7 @@ impl AppState {
             http_clients_by_service: Arc::new(http_clients_by_service),
             anomaly_tracker,
             onchain_store,
-            signer,
+            signer: Arc::new(RwLock::new(signer)),
             started_at,
         }
     }
@@ -95,6 +95,14 @@ impl AppState {
         new_config: Arc<FishnetConfig>,
     ) -> Result<(), watch::error::SendError<Arc<FishnetConfig>>> {
         self.config_tx.send(new_config)
+    }
+
+    pub async fn current_signer(&self) -> Arc<dyn SignerTrait> {
+        self.signer.read().await.clone()
+    }
+
+    pub async fn replace_signer(&self, signer: Arc<dyn SignerTrait>) {
+        *self.signer.write().await = signer;
     }
 
     pub fn http_client_for_service(&self, service: &str) -> &reqwest::Client {

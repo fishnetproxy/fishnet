@@ -10,7 +10,7 @@
 /// Output (two lines):
 ///   0x<signer_address>
 ///   0x<65_byte_signature_hex>
-use fishnet_server::signer::{FishnetPermit, StubSigner, SignerTrait};
+use fishnet_server::signer::{FishnetPermit, SignerTrait, StubSigner};
 
 #[tokio::main]
 async fn main() {

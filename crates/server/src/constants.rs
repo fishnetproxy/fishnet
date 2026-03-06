@@ -13,6 +13,8 @@ pub const BASELINES_FILE: &str = "baselines.json";
 pub const VAULT_DB_FILE: &str = "vault.db";
 pub const CONFIG_FILE: &str = "fishnet.toml";
 pub const CONFIG_TEMP_EXT: &str = "toml.tmp";
+pub const SIGNER_KEY_FILE: &str = "signer_secp256k1.hex";
+pub const BRIDGE_APPROVAL_KEY_FILE: &str = "bridge_approval_p256.hex";
 
 pub const SESSION_TTL_HOURS: i64 = 4;
 pub const MAX_SESSIONS: usize = 5;
@@ -46,6 +48,10 @@ pub const ENV_FISHNET_STORE_DERIVED_KEY_IN_KEYCHAIN: &str = "FISHNET_STORE_DERIV
 pub const ENV_FISHNET_KEYCHAIN_SERVICE: &str = "FISHNET_KEYCHAIN_SERVICE";
 pub const ENV_FISHNET_KEYCHAIN_ACCOUNT: &str = "FISHNET_KEYCHAIN_ACCOUNT";
 pub const ENV_FISHNET_VAULT_REQUIRE_MLOCK: &str = "FISHNET_VAULT_REQUIRE_MLOCK";
+pub const ENV_FISHNET_BRIDGE_APPROVAL_KEYCHAIN_SERVICE: &str =
+    "FISHNET_BRIDGE_APPROVAL_KEYCHAIN_SERVICE";
+pub const ENV_FISHNET_BRIDGE_APPROVAL_KEYCHAIN_ACCOUNT: &str =
+    "FISHNET_BRIDGE_APPROVAL_KEYCHAIN_ACCOUNT";
 
 #[cfg(target_os = "macos")]
 const DEFAULT_SYSTEM_DATA_DIR: &str = "/Library/Application Support/Fishnet";
