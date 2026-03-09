@@ -13,6 +13,7 @@ const routeTitles: Record<string, string> = {
   [ROUTES.ALERTS]: "Alerts",
   [ROUTES.SPEND]: "Spend Analytics",
   [ROUTES.ONCHAIN]: "Onchain Permits",
+  [ROUTES.CREDENTIALS]: "Credentials",
 };
 
 const routeSubtitles: Record<string, string> = {
@@ -21,6 +22,7 @@ const routeSubtitles: Record<string, string> = {
   [ROUTES.ALERTS]: "Monitor and manage security and budget alerts",
   [ROUTES.SPEND]: "Budget tracking and daily spend breakdown",
   [ROUTES.ONCHAIN]: "Contract whitelist, permit history, and signer status",
+  [ROUTES.CREDENTIALS]: "Manage API keys for external services",
 };
 
 export function Shell() {

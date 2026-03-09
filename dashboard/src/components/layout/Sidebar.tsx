@@ -34,7 +34,7 @@ interface NavItemData {
 
 const mainNavItems: NavItemData[] = [
   { to: ROUTES.HOME, label: "Dashboard", icon: <LayoutDashboard size={18} /> },
-  { label: "Credentials", icon: <Key size={18} />, disabled: true },
+  { to: ROUTES.CREDENTIALS, label: "Credentials", icon: <Key size={18} /> },
   { label: "Policies", icon: <Sliders size={18} />, disabled: true },
   { label: "Audit Log", icon: <FileText size={18} />, disabled: true },
   { to: ROUTES.SPEND, label: "Spend", icon: <BarChart3 size={18} /> },
