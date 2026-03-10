@@ -253,6 +253,119 @@ export interface PolicyQuickConfigPayload {
   rate_limit_rpm: number;
 }
 
+// --- Exchange Config ---
+export type EndpointPermission = "always_allowed" | "toggleable" | "permanently_blocked";
+
+export interface ExchangeEndpoint {
+  pattern: string;
+  method: "GET" | "POST" | "PUT" | "DELETE";
+  permission: EndpointPermission;
+  enabled: boolean;
+  description: string;
+  max_order_value?: number;
+  daily_volume_cap?: number;
+}
+
+export interface Exchange {
+  id: string;
+  name: string;
+  base_url: string;
+  auth_pattern: string;
+  status: "connected" | "disconnected" | "error";
+  endpoints: ExchangeEndpoint[];
+  volume: { today_volume_usd: number; daily_cap_usd: number };
+  limits: { max_order_value_usd: number; daily_volume_cap_usd: number };
+}
+
+export interface ExchangeConfigResponse {
+  exchanges: Exchange[];
+}
+
+export interface AddExchangePayload {
+  name: string;
+  base_url: string;
+  auth_pattern: string;
+  blocked_endpoints: string[];
+}
+
+export interface UpdateEndpointPayload {
+  exchange_id: string;
+  endpoint_pattern: string;
+  enabled: boolean;
+  max_order_value?: number;
+  daily_volume_cap?: number;
+}
+
+export interface UpdateExchangeLimitsPayload {
+  exchange_id: string;
+  max_order_value_usd: number;
+  daily_volume_cap_usd: number;
+}
+
+// --- ZK Proofs ---
+export type ProofJobStatus = "pending" | "generating" | "completed" | "failed";
+
+export interface ProofGeneratePayload {
+  from_date: string;
+  to_date: string;
+}
+
+export interface ProofGenerateResponse {
+  job_id: string;
+}
+
+export interface ProofJobStatusResponse {
+  job_id: string;
+  status: ProofJobStatus;
+  progress_pct: number;
+  error?: string;
+}
+
+export interface ProofResult {
+  id: string;
+  job_id: string;
+  generated_at: number;
+  from_date: string;
+  to_date: string;
+  entries_covered: number;
+  merkle_root: string;
+  policy_hash: string;
+  spend_status: "within_budget" | "over_budget" | "no_data";
+  download_url: string;
+}
+
+export interface ProofHistoryResponse {
+  proofs: ProofResult[];
+}
+
+// --- Settings (extended) ---
+export interface ChangePasswordPayload {
+  current_password: string;
+  new_password: string;
+  confirm_password: string;
+}
+
+export interface VaultBackupResponse {
+  download_url: string;
+  filename: string;
+}
+
+export interface NetworkIsolationResponse {
+  enabled: boolean;
+  status: "active" | "inactive" | "error";
+}
+
+export type SignerModeType = "secure_enclave" | "encrypted_keyfile" | "threshold";
+
+export interface SignerModeResponse {
+  current: SignerModeType;
+  available: SignerModeType[];
+}
+
+export interface FactoryResetResponse {
+  success: boolean;
+}
+
 // --- Generic ---
 export interface ApiError {
   error: string;

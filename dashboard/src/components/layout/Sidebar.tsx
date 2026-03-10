@@ -6,6 +6,7 @@ import { ROUTES } from "@/lib/constants";
 import {
   LayoutDashboard,
   Key,
+  ArrowLeftRight,
   Sliders,
   FileText,
   BarChart3,
@@ -15,6 +16,7 @@ import {
   ChevronRight,
   LogOut,
   Shield,
+  ShieldCheck,
 } from "lucide-react";
 interface SidebarProps {
   collapsed: boolean;
@@ -35,10 +37,12 @@ interface NavItemData {
 const mainNavItems: NavItemData[] = [
   { to: ROUTES.HOME, label: "Dashboard", icon: <LayoutDashboard size={18} /> },
   { to: ROUTES.CREDENTIALS, label: "Credentials", icon: <Key size={18} /> },
+  { to: ROUTES.EXCHANGE_CONFIG, label: "Exchange Config", icon: <ArrowLeftRight size={18} /> },
   { label: "Policies", icon: <Sliders size={18} />, disabled: true },
   { label: "Audit Log", icon: <FileText size={18} />, disabled: true },
   { to: ROUTES.SPEND, label: "Spend", icon: <BarChart3 size={18} /> },
   { to: ROUTES.ONCHAIN, label: "Onchain", icon: <Shield size={18} /> },
+  { to: ROUTES.ZK_PROOFS, label: "ZK Proofs", icon: <ShieldCheck size={18} /> },
 ];
 
 function getSecondaryNavItems(alertCount: number): NavItemData[] {
