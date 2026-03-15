@@ -246,7 +246,12 @@ pub async fn set_webhook_url(
         .credential_store
         .decrypt_for_service_and_name(WEBHOOK_VAULT_SERVICE, provider.credential_name())
         .await
-        .map_err(|e| format!("failed to read current {} webhook URL: {e}", provider.as_str()))?
+        .map_err(|e| {
+            format!(
+                "failed to read current {} webhook URL: {e}",
+                provider.as_str()
+            )
+        })?
         .map(|c| c.key.to_string());
 
     clear_webhook_url(state, provider).await?;
@@ -305,8 +310,8 @@ fn validate_webhook_url(raw: &str) -> Result<String, String> {
     }
     let parsed = url::Url::parse(trimmed).map_err(|e| format!("invalid URL: {e}"))?;
 
-    let allow_http = cfg!(test)
-        || std::env::var("FISHNET_DEV").map_or(false, |v| v == "1" || v == "true");
+    let allow_http =
+        cfg!(test) || std::env::var("FISHNET_DEV").map_or(false, |v| v == "1" || v == "true");
     if allow_http {
         if !matches!(parsed.scheme(), "https" | "http") {
             return Err("URL scheme must be http or https".to_string());
@@ -332,10 +337,7 @@ fn reject_internal_host(host: &str) -> Result<(), String> {
     }
 
     let lower = host.to_ascii_lowercase();
-    if lower.ends_with(".local")
-        || lower.ends_with(".internal")
-        || lower.ends_with(".localhost")
-    {
+    if lower.ends_with(".local") || lower.ends_with(".internal") || lower.ends_with(".localhost") {
         return Err(format!(
             "webhook URL must not point to an internal host ({host})"
         ));
@@ -635,11 +637,7 @@ pub async fn create_alert_and_dispatch(
     }
 }
 
-pub async fn dispatch_alert_webhooks_with_logging(
-    state: &AppState,
-    alert: &Alert,
-    context: &str,
-) {
+pub async fn dispatch_alert_webhooks_with_logging(state: &AppState, alert: &Alert, context: &str) {
     for result in dispatch_alert_webhooks(state, alert).await {
         if result.configured && !result.sent {
             eprintln!(

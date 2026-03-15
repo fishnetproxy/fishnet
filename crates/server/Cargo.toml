@@ -28,6 +28,7 @@ sha3.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
 k256.workspace = true
+p256.workspace = true
 alloy-primitives.workspace = true
 hex.workspace = true
 async-trait.workspace = true

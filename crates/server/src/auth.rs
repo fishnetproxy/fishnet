@@ -5,6 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use fishnet_types::auth::*;
+use zeroize::Zeroizing;
 
 use crate::state::AppState;
 
@@ -29,6 +30,9 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> impl I
 }
 
 pub async fn setup(State(state): State<AppState>, Json(req): Json<SetupRequest>) -> Response {
+    let password = Zeroizing::new(req.password);
+    let confirm = Zeroizing::new(req.confirm);
+
     match state.password_store.is_initialized() {
         Ok(true) => {
             return (
@@ -53,7 +57,7 @@ pub async fn setup(State(state): State<AppState>, Json(req): Json<SetupRequest>)
         _ => {}
     }
 
-    if req.password != req.confirm {
+    if password.as_str() != confirm.as_str() {
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -64,7 +68,7 @@ pub async fn setup(State(state): State<AppState>, Json(req): Json<SetupRequest>)
             .into_response();
     }
 
-    if req.password.len() < 8 {
+    if password.len() < 8 {
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -75,7 +79,7 @@ pub async fn setup(State(state): State<AppState>, Json(req): Json<SetupRequest>)
             .into_response();
     }
 
-    match state.password_store.setup(&req.password) {
+    match state.password_store.setup(password.as_str()) {
         Ok(()) => Json(SetupResponse {
             success: true,
             message: "password configured successfully".to_string(),
@@ -93,6 +97,8 @@ pub async fn setup(State(state): State<AppState>, Json(req): Json<SetupRequest>)
 }
 
 pub async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>) -> Response {
+    let password = Zeroizing::new(req.password);
+
     if let Err(retry_after) = state.rate_limiter.check_rate_limit().await {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -106,7 +112,7 @@ pub async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>)
 
     state.rate_limiter.progressive_delay().await;
 
-    match state.password_store.verify(&req.password) {
+    match state.password_store.verify(password.as_str()) {
         Ok(true) => {
             state.rate_limiter.reset().await;
             let session = state.session_store.create().await;
