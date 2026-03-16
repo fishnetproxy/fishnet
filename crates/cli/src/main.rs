@@ -41,9 +41,7 @@ use security_framework::key::{Algorithm, GenerateKeyOptions, KeyType, SecKey, To
 #[cfg(target_os = "macos")]
 use security_framework::passwords::{get_generic_password, set_generic_password};
 #[cfg(all(target_os = "macos", not(feature = "dev-seed")))]
-use security_framework_sys::access_control::{
-    kSecAccessControlPrivateKeyUsage, kSecAccessControlUserPresence,
-};
+use security_framework_sys::access_control::kSecAccessControlPrivateKeyUsage;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -128,6 +126,10 @@ struct InitArgs {
     /// Apply system-level user/permission setup commands (default: dry-run/print only)
     #[arg(long)]
     apply_system: bool,
+    /// Only perform system user + permissions setup (skip vault/credential/config steps).
+    /// Use this when setting up the _fishnet system user before running full init as that user.
+    #[arg(long)]
+    system_only: bool,
 }
 
 #[derive(Debug, Args)]
@@ -336,6 +338,20 @@ async fn cmd_start(explicit_config: Option<PathBuf>) -> Result<(), String> {
 }
 
 async fn cmd_stop() -> Result<(), String> {
+    // If installed as a LaunchDaemon, use launchctl to stop.
+    let daemon_plist = PathBuf::from(format!(
+        "/Library/LaunchDaemons/{LAUNCH_AGENT_LABEL}.plist"
+    ));
+    if daemon_plist.exists() {
+        run_shell(&format!(
+            "sudo launchctl unload -w {}",
+            shell_quote_path(&daemon_plist)
+        ))?;
+        println!("Fishnet daemon stopped. Restart with: sudo launchctl load -w {}", daemon_plist.display());
+        return Ok(());
+    }
+
+    // Fallback: PID-based stop for direct `fishnet start` invocations.
     let Some(pid_file) = read_pid_file()? else {
         println!("Fishnet is not running.");
         return Ok(());
@@ -365,6 +381,26 @@ async fn cmd_stop() -> Result<(), String> {
 }
 
 async fn cmd_init(explicit_config: Option<PathBuf>, args: InitArgs) -> Result<(), String> {
+    // Phase 1: system user + permissions (always runs, even with --system-only).
+    let system_setup_commands = default_system_user_setup_commands()?;
+    execute_plan(
+        "System user + permissions setup",
+        &system_setup_commands,
+        args.apply_system,
+    )?;
+
+    if args.system_only {
+        println!("System setup complete.");
+        println!();
+        println!("Next: run full init as the _fishnet user to set up the vault:");
+        #[cfg(target_os = "macos")]
+        println!("  sudo -u _fishnet fishnet init --master-password <pw> --store-derived-key-in-keychain --first-service openai --first-key sk-...");
+        #[cfg(target_os = "linux")]
+        println!("  sudo -u fishnet fishnet init --master-password <pw> --first-service openai --first-key sk-...");
+        return Ok(());
+    }
+
+    // Phase 2: vault, credentials, and config (must run as the _fishnet/fishnet user).
     let master_password = match args.master_password {
         Some(v) if !v.trim().is_empty() => v.trim().to_string(),
         _ => {
@@ -385,6 +421,8 @@ async fn cmd_init(explicit_config: Option<PathBuf>, args: InitArgs) -> Result<()
             "[fishnet] warning: master password length is short; consider at least 12+ characters"
         );
     }
+
+    ensure_local_data_dir_permissions()?;
 
     let store = open_credential_store(vault_db_path()?, Some(&master_password))?;
     maybe_store_derived_key_in_keychain(&store, args.store_derived_key_in_keychain);
@@ -426,15 +464,6 @@ async fn cmd_init(explicit_config: Option<PathBuf>, args: InitArgs) -> Result<()
     cfg.validate()?;
     save_config(&config_path, &cfg).map_err(|e| format!("failed to save config: {e}"))?;
 
-    ensure_local_data_dir_permissions()?;
-
-    let system_setup_commands = default_system_user_setup_commands()?;
-    execute_plan(
-        "System user + permissions setup",
-        &system_setup_commands,
-        args.apply_system,
-    )?;
-
     println!("Fishnet init complete.");
     println!(
         "Stored first credential '{}:{}', config written to {}",
@@ -442,7 +471,7 @@ async fn cmd_init(explicit_config: Option<PathBuf>, args: InitArgs) -> Result<()
         first_name,
         config_path.display()
     );
-    println!("Run: fishnet start");
+    println!("Run: sudo fishnet service install --apply");
     Ok(())
 }
 
@@ -635,16 +664,18 @@ fn cmd_service_install(args: ServiceInstallArgs) -> Result<(), String> {
     let (unit_path, unit_contents, commands) = service_install_plan(&exe)?;
 
     if args.apply {
-        if let Some(parent) = unit_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("failed to create service dir: {e}"))?;
-        }
-        std::fs::write(&unit_path, &unit_contents)
-            .map_err(|e| format!("failed to write service unit: {e}"))?;
+        // LaunchDaemon / system service paths require root; write via sudo tee.
+        let write_cmd = format!(
+            "echo {} | sudo tee {} >/dev/null",
+            shell_escape_content(&unit_contents),
+            shell_quote_path(&unit_path)
+        );
+        run_shell(&write_cmd)?;
         for cmd in &commands {
             run_shell(cmd)?;
         }
         println!("Service installed at {}", unit_path.display());
+        println!("Fishnet will run as the dedicated system user (_fishnet on macOS, fishnet on Linux).");
     } else {
         println!("Dry-run: service install plan");
         println!("  unit path: {}", unit_path.display());
@@ -655,7 +686,7 @@ fn cmd_service_install(args: ServiceInstallArgs) -> Result<(), String> {
         for cmd in &commands {
             println!("    {cmd}");
         }
-        println!("Use --apply to execute.");
+        println!("Use --apply to execute (requires sudo).");
     }
 
     Ok(())
@@ -669,8 +700,7 @@ fn cmd_service_uninstall(args: ServiceUninstallArgs) -> Result<(), String> {
             run_shell(cmd)?;
         }
         if unit_path.exists() {
-            std::fs::remove_file(&unit_path)
-                .map_err(|e| format!("failed to remove service unit: {e}"))?;
+            run_shell(&format!("sudo rm -f {}", shell_quote_path(&unit_path)))?;
         }
         println!("Service uninstalled.");
     } else {
@@ -679,7 +709,7 @@ fn cmd_service_uninstall(args: ServiceUninstallArgs) -> Result<(), String> {
         for cmd in &commands {
             println!("    {cmd}");
         }
-        println!("Use --apply to execute.");
+        println!("Use --apply to execute (requires sudo).");
     }
 
     Ok(())
@@ -1314,6 +1344,10 @@ fn default_system_user_setup_commands() -> Result<Vec<String>, String> {
             "sudo mkdir -p /var/lib/fishnet".to_string(),
             "sudo chown fishnet:fishnet /var/lib/fishnet".to_string(),
             "sudo chmod 700 /var/lib/fishnet".to_string(),
+            // Environment file for vault unlock (master password or derived key).
+            "sudo touch /var/lib/fishnet/env".to_string(),
+            "sudo chown fishnet:fishnet /var/lib/fishnet/env".to_string(),
+            "sudo chmod 600 /var/lib/fishnet/env".to_string(),
         ];
         return Ok(cmds);
     }
@@ -1468,10 +1502,9 @@ fn set_owner_only_file_permissions(path: &Path) -> Result<(), String> {
 fn service_install_plan(exe: &Path) -> Result<(PathBuf, String, Vec<String>), String> {
     #[cfg(target_os = "macos")]
     {
-        let mut path =
-            dirs::home_dir().ok_or_else(|| "could not determine home directory".to_string())?;
-        path.push("Library/LaunchAgents");
-        path.push(format!("{LAUNCH_AGENT_LABEL}.plist"));
+        let path = PathBuf::from(format!(
+            "/Library/LaunchDaemons/{LAUNCH_AGENT_LABEL}.plist"
+        ));
         fn escape_xml(s: &str) -> String {
             s.replace('&', "&amp;")
                 .replace('<', "&lt;")
@@ -1480,6 +1513,9 @@ fn service_install_plan(exe: &Path) -> Result<(PathBuf, String, Vec<String>), St
                 .replace('\'', "&apos;")
         }
         let escaped_exe = escape_xml(&exe.to_string_lossy());
+        let data_dir = fishnet_server::constants::default_data_dir()
+            .unwrap_or_else(|| PathBuf::from("/Library/Application Support/Fishnet"));
+        let log_path = escape_xml(&data_dir.join("fishnet.log").to_string_lossy());
         let contents = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1492,20 +1528,28 @@ fn service_install_plan(exe: &Path) -> Result<(PathBuf, String, Vec<String>), St
       <string>{escaped_exe}</string>
       <string>start</string>
     </array>
+    <key>UserName</key>
+    <string>_fishnet</string>
+    <key>GroupName</key>
+    <string>wheel</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>StandardErrorPath</key>
+    <string>{log_path}</string>
+    <key>StandardOutPath</key>
+    <string>{log_path}</string>
   </dict>
 </plist>
 "#
         );
         let commands = vec![
             format!(
-                "launchctl unload -w {} >/dev/null 2>&1 || true",
+                "sudo launchctl unload -w {} >/dev/null 2>&1 || true",
                 shell_quote_path(&path)
             ),
-            format!("launchctl load -w {}", shell_quote_path(&path)),
+            format!("sudo launchctl load -w {}", shell_quote_path(&path)),
         ];
         return Ok((path, contents, commands));
     }
@@ -1513,17 +1557,14 @@ fn service_install_plan(exe: &Path) -> Result<(PathBuf, String, Vec<String>), St
     #[cfg(target_os = "linux")]
     {
         let exe_quoted = shell_quote_path(exe);
-        let mut path =
-            dirs::home_dir().ok_or_else(|| "could not determine home directory".to_string())?;
-        path.push(".config/systemd/user");
-        path.push(format!("{SERVICE_NAME}.service"));
+        let path = PathBuf::from(format!("/etc/systemd/system/{SERVICE_NAME}.service"));
         let contents = format!(
-            "[Unit]\nDescription=Fishnet local security proxy\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart={} start\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n",
+            "[Unit]\nDescription=Fishnet local security proxy\nAfter=network-online.target\n\n[Service]\nType=simple\nUser=fishnet\nGroup=fishnet\nExecStart={} start\nRestart=on-failure\nRestartSec=2\nEnvironmentFile=-/var/lib/fishnet/env\n\n[Install]\nWantedBy=multi-user.target\n",
             exe_quoted
         );
         let commands = vec![
-            "systemctl --user daemon-reload".to_string(),
-            format!("systemctl --user enable --now {SERVICE_NAME}.service"),
+            "sudo systemctl daemon-reload".to_string(),
+            format!("sudo systemctl enable --now {SERVICE_NAME}.service"),
         ];
         return Ok((path, contents, commands));
     }
@@ -1535,12 +1576,11 @@ fn service_install_plan(exe: &Path) -> Result<(PathBuf, String, Vec<String>), St
 fn service_uninstall_plan() -> Result<(PathBuf, Vec<String>), String> {
     #[cfg(target_os = "macos")]
     {
-        let mut path =
-            dirs::home_dir().ok_or_else(|| "could not determine home directory".to_string())?;
-        path.push("Library/LaunchAgents");
-        path.push(format!("{LAUNCH_AGENT_LABEL}.plist"));
+        let path = PathBuf::from(format!(
+            "/Library/LaunchDaemons/{LAUNCH_AGENT_LABEL}.plist"
+        ));
         let commands = vec![format!(
-            "launchctl unload -w {} >/dev/null 2>&1 || true",
+            "sudo launchctl unload -w {} >/dev/null 2>&1 || true",
             shell_quote_path(&path)
         )];
         return Ok((path, commands));
@@ -1548,13 +1588,10 @@ fn service_uninstall_plan() -> Result<(PathBuf, Vec<String>), String> {
 
     #[cfg(target_os = "linux")]
     {
-        let mut path =
-            dirs::home_dir().ok_or_else(|| "could not determine home directory".to_string())?;
-        path.push(".config/systemd/user");
-        path.push(format!("{SERVICE_NAME}.service"));
+        let path = PathBuf::from(format!("/etc/systemd/system/{SERVICE_NAME}.service"));
         let commands = vec![
-            format!("systemctl --user disable --now {SERVICE_NAME}.service || true"),
-            "systemctl --user daemon-reload".to_string(),
+            format!("sudo systemctl disable --now {SERVICE_NAME}.service || true"),
+            "sudo systemctl daemon-reload".to_string(),
         ];
         return Ok((path, commands));
     }
@@ -1808,6 +1845,11 @@ fn truncate_reason(value: &str) -> String {
 fn shell_quote_path(path: &Path) -> String {
     let raw = path.to_string_lossy();
     format!("'{}'", raw.replace('\'', "'\\''"))
+}
+
+/// Shell-escape arbitrary content for use with `echo '...' | sudo tee`.
+fn shell_escape_content(content: &str) -> String {
+    format!("'{}'", content.replace('\'', "'\\''"))
 }
 
 fn csv_cell(cell: &str) -> String {
@@ -2124,7 +2166,11 @@ fn find_bridge_approval_secure_enclave_key(label: &str) -> Result<Option<SecKey>
 
 #[cfg(all(target_os = "macos", not(feature = "dev-seed")))]
 fn create_bridge_approval_secure_enclave_key(label: &str) -> Result<SecKey, String> {
-    let access_flags = kSecAccessControlPrivateKeyUsage | kSecAccessControlUserPresence;
+    // UserPresence removed: OS-level user separation (_fishnet system user) protects the
+    // Secure Enclave key from rogue agents. The agent user cannot call task_for_pid or
+    // access _fishnet's keychain, so biometric gating is unnecessary and would block
+    // autonomous signing.
+    let access_flags = kSecAccessControlPrivateKeyUsage;
     let build_access_control = || {
         SecAccessControl::create_with_protection(
             Some(ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly),
